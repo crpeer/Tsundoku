@@ -170,6 +170,8 @@ class AddSourceViewModel(private val container: AppContainer) : ViewModel() {
                     }
 
                     SourceType.LOCAL -> error("本地来源无需添加")
+
+                    SourceType.LEGADO -> error("阅读书源请用「导入阅读书源」")
                 }
                 container.sources.add(
                     BookSourceInfo(

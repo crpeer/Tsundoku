@@ -7,11 +7,17 @@ import android.webkit.WebView
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -21,10 +27,13 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.List
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
@@ -40,6 +49,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -51,6 +61,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -59,8 +70,12 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
+import app.tsundoku.reader.data.prefs.ReaderFontFamily
+import app.tsundoku.reader.data.prefs.ReaderFontWeight
+import app.tsundoku.reader.data.prefs.ReaderLayout
 import app.tsundoku.reader.data.prefs.ReaderSettings
 import app.tsundoku.reader.data.prefs.ReaderTheme
+import app.tsundoku.reader.data.prefs.ReaderWritingMode
 import app.tsundoku.reader.di.AppContainer
 import app.tsundoku.reader.domain.model.Book
 import app.tsundoku.reader.domain.model.BookFormat
@@ -81,6 +96,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.Locale
+import kotlin.math.roundToInt
 
 sealed interface ChapterContent {
     data object Loading : ChapterContent
@@ -158,6 +175,38 @@ class ReaderViewModel(
         viewModelScope.launch { container.settings.setTheme(theme) }
     }
 
+    fun setFontFamily(family: ReaderFontFamily) {
+        viewModelScope.launch { container.settings.setFontFamily(family) }
+    }
+
+    fun setFontWeight(weight: ReaderFontWeight) {
+        viewModelScope.launch { container.settings.setFontWeight(weight) }
+    }
+
+    fun setLineHeight(value: Float) {
+        viewModelScope.launch { container.settings.setLineHeight(value) }
+    }
+
+    fun setParagraphSpacing(value: Float) {
+        viewModelScope.launch { container.settings.setParagraphSpacing(value) }
+    }
+
+    fun setTextIndent(value: Float) {
+        viewModelScope.launch { container.settings.setTextIndent(value) }
+    }
+
+    fun setHorizontalPadding(value: Int) {
+        viewModelScope.launch { container.settings.setHorizontalPadding(value) }
+    }
+
+    fun setWritingMode(mode: ReaderWritingMode) {
+        viewModelScope.launch { container.settings.setWritingMode(mode) }
+    }
+
+    fun setLayout(layout: ReaderLayout) {
+        viewModelScope.launch { container.settings.setLayout(layout) }
+    }
+
     fun consumeMessage() {
         _message.value = null
     }
@@ -170,6 +219,7 @@ class ReaderViewModel(
             _content.value = ChapterContent.Loading
             container.library.updateProgress(current.id, index)
             container.library.markRead(current.id, index, true)
+            container.meta.sync(current.id)
 
             val stored = chapter.content
             val localPath = stored?.takeIf { it.isNotBlank() && File(it).exists() }
@@ -223,6 +273,7 @@ fun ReaderScreen(
     var showToc by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
     var pdfPage by remember { mutableStateOf(0) }
+    var pageInfo by remember { mutableStateOf(0 to 1) }
     val snackbarHostState = remember { SnackbarHostState() }
 
     LaunchedEffect(message) {
@@ -236,9 +287,25 @@ fun ReaderScreen(
     val isPdf = current?.format == BookFormat.PDF
     val chapter = chapters.getOrNull(index)
 
+    val readerTheme = settings.theme.resolved(isSystemInDarkTheme())
+    val readerBg = Color(android.graphics.Color.parseColor(readerTheme.bg))
+    val readerFg = Color(android.graphics.Color.parseColor(readerTheme.fg))
+    val themedChrome = !isPdf && current != null
+
     Scaffold(
+        containerColor = if (themedChrome) readerBg else MaterialTheme.colorScheme.background,
         topBar = {
             TopAppBar(
+                colors = if (themedChrome) {
+                    TopAppBarDefaults.topAppBarColors(
+                        containerColor = readerBg,
+                        titleContentColor = readerFg,
+                        navigationIconContentColor = readerFg,
+                        actionIconContentColor = readerFg,
+                    )
+                } else {
+                    TopAppBarDefaults.topAppBarColors()
+                },
                 title = {
                     Column {
                         Text(
@@ -251,10 +318,19 @@ fun ReaderScreen(
                             text = if (isPdf) {
                                 "第 ${pdfPage + 1} / ${current?.pageCount ?: 0} 页"
                             } else {
-                                "${index + 1} / ${chapters.size}"
+                                val base = "${index + 1} / ${chapters.size}"
+                                if (settings.layout == ReaderLayout.PAGED) {
+                                    "$base · 第 ${pageInfo.first + 1} 页"
+                                } else {
+                                    base
+                                }
                             },
                             style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            color = if (themedChrome) {
+                                readerFg.copy(alpha = 0.7f)
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
                         )
                     }
                 },
@@ -277,7 +353,7 @@ fun ReaderScreen(
         },
         bottomBar = {
             if (!isPdf && chapters.isNotEmpty()) {
-                Surface(tonalElevation = 3.dp) {
+                Surface(color = readerBg, tonalElevation = 0.dp) {
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -285,16 +361,25 @@ fun ReaderScreen(
                         TextButton(
                             onClick = viewModel::previous,
                             enabled = index > 0,
+                            colors = ButtonDefaults.textButtonColors(
+                                contentColor = readerFg,
+                                disabledContentColor = readerFg.copy(alpha = 0.38f),
+                            ),
                         ) { Text("上一章") }
                         Text(
                             text = "${index + 1} / ${chapters.size}",
                             modifier = Modifier.weight(1f),
                             textAlign = TextAlign.Center,
                             style = MaterialTheme.typography.labelMedium,
+                            color = readerFg.copy(alpha = 0.7f),
                         )
                         TextButton(
                             onClick = viewModel::next,
                             enabled = index < chapters.size - 1,
+                            colors = ButtonDefaults.textButtonColors(
+                                contentColor = readerFg,
+                                disabledContentColor = readerFg.copy(alpha = 0.38f),
+                            ),
                         ) { Text("下一章") }
                     }
                 }
@@ -325,8 +410,9 @@ fun ReaderScreen(
                     is ChapterContent.Ready -> ChapterView(
                         html = state.html,
                         localPath = state.localPath,
-                        theme = settings.theme,
-                        fontSize = settings.fontSize,
+                        readerSettings = settings,
+                        theme = readerTheme,
+                        onPageChanged = { page, pages -> pageInfo = page to pages },
                         modifier = Modifier.fillMaxSize(),
                     )
                 }
@@ -368,88 +454,272 @@ fun ReaderScreen(
 
     if (showSettings) {
         ModalBottomSheet(onDismissRequest = { showSettings = false }) {
-            Column(modifier = Modifier.padding(horizontal = 20.dp)) {
-                Text("字号 · ${settings.fontSize}", style = MaterialTheme.typography.titleSmall)
-                Slider(
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .fillMaxHeight(0.85f)
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 20.dp)
+                    .padding(bottom = 28.dp),
+            ) {
+                SettingSlider(
+                    title = "字号",
+                    valueLabel = "${settings.fontSize} px",
                     value = settings.fontSize.toFloat(),
-                    onValueChange = { viewModel.setFontSize(it.toInt()) },
-                    valueRange = 13f..34f,
+                    range = 13f..34f,
                     steps = 20,
+                    onChange = { viewModel.setFontSize(it.toInt()) },
                 )
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.padding(vertical = 12.dp),
-                ) {
-                    ReaderTheme.entries.forEach { theme ->
-                        FilterChip(
-                            selected = theme == settings.theme,
-                            onClick = { viewModel.setTheme(theme) },
-                            label = { Text(theme.label) },
-                        )
-                    }
-                }
-                Spacer(Modifier.height(24.dp))
+                SettingSlider(
+                    title = "行距",
+                    valueLabel = formatDecimal(settings.lineHeight),
+                    value = settings.lineHeight,
+                    range = 1.2f..2.6f,
+                    steps = 13,
+                    onChange = viewModel::setLineHeight,
+                )
+                SettingSlider(
+                    title = "段距",
+                    valueLabel = "${formatDecimal(settings.paragraphSpacing)} em",
+                    value = settings.paragraphSpacing,
+                    range = 0f..2f,
+                    steps = 7,
+                    onChange = viewModel::setParagraphSpacing,
+                )
+                SettingSlider(
+                    title = "首行缩进",
+                    valueLabel = "${formatDecimal(settings.textIndent)} 字",
+                    value = settings.textIndent,
+                    range = 0f..3f,
+                    steps = 5,
+                    onChange = viewModel::setTextIndent,
+                )
+                SettingSlider(
+                    title = "页边距",
+                    valueLabel = "${settings.horizontalPadding} px",
+                    value = settings.horizontalPadding.toFloat(),
+                    range = 12f..40f,
+                    steps = 13,
+                    onChange = { viewModel.setHorizontalPadding(it.toInt()) },
+                )
+                SettingChips(
+                    title = "字族",
+                    options = ReaderFontFamily.entries,
+                    selected = settings.fontFamily,
+                    label = { it.label },
+                    onSelect = viewModel::setFontFamily,
+                )
+                SettingChips(
+                    title = "字重",
+                    options = ReaderFontWeight.entries,
+                    selected = settings.fontWeight,
+                    label = { it.label },
+                    onSelect = viewModel::setFontWeight,
+                )
+                SettingChips(
+                    title = "阅读模式",
+                    options = ReaderLayout.entries,
+                    selected = settings.layout,
+                    label = { it.label },
+                    onSelect = viewModel::setLayout,
+                )
+                SettingChips(
+                    title = "书写方向",
+                    options = ReaderWritingMode.entries,
+                    selected = settings.writingMode,
+                    label = { it.label },
+                    onSelect = viewModel::setWritingMode,
+                )
+                SettingChips(
+                    title = "主题",
+                    options = ReaderTheme.entries,
+                    selected = settings.theme,
+                    label = { it.label },
+                    onSelect = viewModel::setTheme,
+                )
             }
         }
     }
 }
 
-private fun cssFor(theme: ReaderTheme, fontSize: Int): String = """
+private fun formatDecimal(value: Float): String = String.format(Locale.US, "%.2f", value)
+
+@Composable
+private fun SettingSlider(
+    title: String,
+    valueLabel: String,
+    value: Float,
+    range: ClosedFloatingPointRange<Float>,
+    steps: Int,
+    onChange: (Float) -> Unit,
+) {
+    Column(modifier = Modifier.padding(top = 12.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleSmall,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                text = valueLabel,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Slider(
+            value = value,
+            onValueChange = onChange,
+            valueRange = range,
+            steps = steps,
+        )
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun <T> SettingChips(
+    title: String,
+    options: List<T>,
+    selected: T,
+    label: (T) -> String,
+    onSelect: (T) -> Unit,
+) {
+    Text(
+        text = title,
+        style = MaterialTheme.typography.titleSmall,
+        modifier = Modifier.padding(top = 16.dp, bottom = 8.dp),
+    )
+    FlowRow(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        options.forEach { option ->
+            FilterChip(
+                selected = option == selected,
+                onClick = { onSelect(option) },
+                label = { Text(label(option)) },
+            )
+        }
+    }
+}
+
+private fun cssFor(
+    theme: ReaderTheme,
+    s: ReaderSettings,
+    viewWidthPx: Int,
+    viewHeightPx: Int,
+): String {
+    val pad = s.horizontalPadding
+    val vertical = s.writingMode == ReaderWritingMode.VERTICAL
+    val paged = s.layout == ReaderLayout.PAGED && !vertical
+    val blockFlow = when {
+        paged -> {
+            // 一列 = 一页：列宽 = 可视宽度 - 2*pad，列间距 = 2*pad，所以翻页步长正好等于可视宽度。
+            """
+            html { overflow-x: auto; overflow-y: hidden; }
+            body {
+              height: ${viewHeightPx}px;
+              padding: 8px ${pad}px;
+              box-sizing: border-box;
+              column-width: ${(viewWidthPx - pad * 2).coerceAtLeast(120)}px;
+              column-gap: ${pad * 2}px;
+              column-fill: auto;
+            }
+            """.trimIndent()
+        }
+
+        vertical -> {
+            // vertical-rl 的块轴是水平的，行长度 = block-size；WebView 不认 vh/%，用实测高度写死。
+            """
+            html { writing-mode: ${s.writingMode.css}; -webkit-writing-mode: ${s.writingMode.css}; height: ${viewHeightPx}px; }
+            body { writing-mode: ${s.writingMode.css}; -webkit-writing-mode: ${s.writingMode.css}; height: ${viewHeightPx}px; padding: 16px ${pad}px; }
+            """.trimIndent()
+        }
+
+        else -> """
+            html { writing-mode: ${s.writingMode.css}; }
+            body { padding: 8px ${pad}px 64px ${pad}px; }
+        """.trimIndent()
+    }
+    val media = if (vertical) {
+        "img, video, svg { max-width: none; max-height: 60vh; }"
+    } else {
+        "img, video, svg { max-width: 100%; height: auto; }"
+    }
+    val breakRule = if (paged) "h1, h2, h3 { break-after: avoid; }" else ""
+    return """
     html, body {
       margin: 0;
-      padding: 0 18px 64px 18px;
+      padding: 0;
       background: ${theme.bg};
       color: ${theme.fg};
-      font-size: ${fontSize}px;
-      line-height: 1.85;
+      font-size: ${s.fontSize}px;
+      font-family: ${s.fontFamily.css};
+      font-weight: ${s.fontWeight.css};
+      line-height: ${s.lineHeight};
       -webkit-text-size-adjust: 100%;
       word-wrap: break-word;
     }
-    body { padding-top: 8px; }
-    p { margin: 0 0 0.85em 0; text-indent: 2em; }
-    img, video, svg { max-width: 100%; height: auto; }
+    $blockFlow
+    p { margin: 0 0 ${s.paragraphSpacing}em 0; text-indent: ${s.textIndent}em; }
+    $media
     h1, h2, h3 { line-height: 1.45; margin: 1em 0 0.6em; }
+    $breakRule
     a { color: inherit; }
     pre { white-space: pre-wrap; }
 """.trimIndent()
+}
 
 @Suppress("UnusedReceiverParameter")
 @Composable
 private fun ChapterView(
     html: String?,
     localPath: String?,
+    readerSettings: ReaderSettings,
     theme: ReaderTheme,
-    fontSize: Int,
+    onPageChanged: (page: Int, pageCount: Int) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    AndroidView(
-        modifier = modifier.background(Color(android.graphics.Color.parseColor(theme.bg))),
-        factory = { context ->
-            WebView(context).apply {
-                settings.javaScriptEnabled = false
-                settings.useWideViewPort = true
-                settings.loadWithOverviewMode = true
-                settings.textZoom = 100
-                settings.setSupportZoom(false)
-                settings.builtInZoomControls = false
-                setBackgroundColor(android.graphics.Color.TRANSPARENT)
-            }
-        },
-        update = { web ->
-            val style = cssFor(theme, fontSize)
+    BoxWithConstraints(modifier = modifier) {
+        // CSS px == dp here (viewport meta width=device-width, initial-scale=1), so the measured
+        // size in dp is directly usable as a CSS length.
+        val viewWidthPx = maxWidth.value.roundToInt().coerceAtLeast(1)
+        val viewHeightPx = maxHeight.value.roundToInt().coerceAtLeast(1)
+        val paged = readerSettings.layout == ReaderLayout.PAGED &&
+            readerSettings.writingMode != ReaderWritingMode.VERTICAL
+        var webRef by remember { mutableStateOf<WebView?>(null) }
+
+        AndroidView(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color(android.graphics.Color.parseColor(theme.bg))),
+            factory = { context ->
+                WebView(context).apply {
+                    settings.javaScriptEnabled = false
+                    settings.useWideViewPort = true
+                    settings.loadWithOverviewMode = false
+                    settings.textZoom = 100
+                    settings.setSupportZoom(false)
+                    settings.builtInZoomControls = false
+                    setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                }.also { webRef = it }
+            },
+            update = { web ->
+                val style = cssFor(theme, readerSettings, viewWidthPx, viewHeightPx)
             when {
                 localPath != null -> {
                     val file = File(localPath)
                     val raw = runCatching { file.readText() }.getOrNull()
                     if (raw != null) {
+                        val meta = "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
                         val injected = if (raw.contains("</head>", ignoreCase = true)) {
                             raw.replaceFirst(
                                 "</head>",
-                                "<style>$style</style></head>",
+                                "$meta<style>$style</style></head>",
                                 ignoreCase = true,
                             )
                         } else {
-                            "<style>$style</style>$raw"
+                            "$meta<style>$style</style>$raw"
                         }
                         web.loadDataWithBaseURL(
                             "file://${file.parentFile?.absolutePath}/",
@@ -472,9 +742,46 @@ private fun ChapterView(
                 )
 
                 else -> Unit
-            }
-        },
-    )
+                }
+                web.post {
+                    if (paged) {
+                        val step = web.width
+                        val page = if (step <= 0) 0 else web.scrollX / step
+                        onPageChanged(page, 0)
+                    } else {
+                        onPageChanged(0, 1)
+                    }
+                }
+            },
+        )
+
+        if (paged) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .pointerInput(viewWidthPx) {
+                        var dragged = 0f
+                        detectHorizontalDragGestures(
+                            onDragStart = { dragged = 0f },
+                            onDragEnd = {
+                                val web = webRef ?: return@detectHorizontalDragGestures
+                                val step = web.width
+                                when {
+                                    dragged <= -40f -> web.scrollBy(step, 0)
+                                    dragged >= 40f -> web.scrollBy(-step, 0)
+                                    else -> return@detectHorizontalDragGestures
+                                }
+                                web.post {
+                                    val step = web.width.coerceAtLeast(1)
+                                    onPageChanged((web.scrollX / step).coerceAtLeast(0), 0)
+                                }
+                            },
+                            onHorizontalDrag = { _, amount -> dragged += amount },
+                        )
+                    },
+            )
+        }
+    }
 }
 
 private class PdfHolder(

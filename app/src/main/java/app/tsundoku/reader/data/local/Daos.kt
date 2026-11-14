@@ -34,6 +34,18 @@ interface BookDao {
     @Query("SELECT * FROM books WHERE sourceId = :sourceId ORDER BY id DESC")
     suspend fun getBySource(sourceId: Long): List<BookEntity>
 
+    @Query(
+        """
+        SELECT b.*,
+            (SELECT COUNT(*) FROM chapters c WHERE c.bookId = b.id) AS chapterCount,
+            (SELECT COUNT(*) FROM chapters c WHERE c.bookId = b.id AND c.read = 1) AS readCount
+        FROM books b
+        WHERE b.inLibrary = 1
+        ORDER BY COALESCE(b.lastReadAt, 0) DESC, b.updatedAt DESC
+        """,
+    )
+    suspend fun getLibrary(): List<BookWithStats>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(book: BookEntity): Long
 
@@ -114,6 +126,9 @@ interface SourceDao {
 
     @Query("SELECT * FROM sources WHERE id = :id")
     suspend fun get(id: Long): SourceEntity?
+
+    @Query("SELECT * FROM sources ORDER BY addedAt ASC")
+    suspend fun getAll(): List<SourceEntity>
 
     @Query("SELECT COUNT(*) FROM sources")
     suspend fun count(): Int

@@ -7,6 +7,8 @@ import app.tsundoku.reader.data.local.BookEntity
 import app.tsundoku.reader.data.local.ChapterEntity
 import app.tsundoku.reader.data.net.NetworkClient
 import app.tsundoku.reader.data.repo.LibraryRepository
+import app.tsundoku.reader.data.storage.BookStorage
+import app.tsundoku.reader.data.storage.MetadataSyncer
 import app.tsundoku.reader.domain.model.Book
 import app.tsundoku.reader.domain.model.BookFormat
 import kotlinx.coroutines.Dispatchers
@@ -15,15 +17,18 @@ import java.io.File
 import java.io.IOException
 import java.util.UUID
 
-/** 把外部文件（SAF / 下载）转化成书库记录。 */
+/**
+ * 把外部文件（SAF / 下载）转化成书库记录。
+ *
+ * 目录结构走 Mihon 风格：一本书一个文件夹，里面放原文件、cover.png、meta.json。
+ */
 class BookImporter(
     private val context: Context,
     private val library: LibraryRepository,
     private val network: NetworkClient,
+    private val storage: BookStorage,
+    private val syncer: MetadataSyncer,
 ) {
-
-    private val booksDir = File(context.filesDir, "books")
-    private val coversDir = File(context.filesDir, "covers")
 
     suspend fun importUri(uri: Uri, displayName: String? = null): Long = withContext(Dispatchers.IO) {
         val name = sanitize(displayName ?: queryDisplayName(uri) ?: "未命名书籍.txt")
@@ -37,13 +42,18 @@ class BookImporter(
     suspend fun importFile(file: File, name: String): Long = withContext(Dispatchers.IO) {
         val safeName = sanitize(name)
         val title = safeName.substringBeforeLast('.', safeName)
-        when (BookFormat.fromName(safeName)) {
-            BookFormat.EPUB -> importEpub(file, title)
-            BookFormat.PDF -> importPdf(file, title)
-            else -> importTxt(file, title)
-        }.also {
-            if (file.parentFile == context.cacheDir) file.delete()
+        val folder = storage.bookFolder(title)
+        val format = BookFormat.fromName(safeName)
+        val local = File(folder, "book.${safeName.substringAfterLast('.', "txt")}")
+        if (file.absolutePath != local.absolutePath) file.copyTo(local, overwrite = true)
+        val bookId = when (format) {
+            BookFormat.EPUB -> importEpub(local, folder, title)
+            BookFormat.PDF -> importPdf(local, folder, title)
+            else -> importTxt(local, title)
         }
+        if (file.parentFile == context.cacheDir) file.delete()
+        syncer.sync(bookId)
+        bookId
     }
 
     /** OPDS 等远端书籍：下载到本地后按格式导入。 */
@@ -59,22 +69,23 @@ class BookImporter(
             throw IOException("暂不支持该格式：$url")
         }
         val extension = if (format == BookFormat.EPUB) "epub" else "pdf"
-        val temp = File(context.cacheDir, "remote-${UUID.randomUUID()}.$extension")
-        network.download(url, temp, onProgress = onProgress)
+        val folder = storage.bookFolder(title)
+        val local = File(folder, "book.$extension")
+        network.download(url, local, onProgress = onProgress)
         val bookId = if (format == BookFormat.EPUB) {
-            importEpub(temp, title)
+            importEpub(local, folder, title)
         } else {
-            importPdf(temp, title)
+            importPdf(local, folder, title)
         }
-        temp.delete()
         library.updateMeta(
             bookId = bookId,
             title = title.ifBlank { "未命名书籍" },
             author = author,
             coverUrl = coverUrl,
-            coverPath = null,
+            coverPath = File(folder, "cover.png").takeIf { it.exists() }?.absolutePath,
             description = null,
         )
+        syncer.sync(bookId)
         bookId
     }
 
@@ -113,11 +124,11 @@ class BookImporter(
         )
     }
 
-    private suspend fun importEpub(file: File, title: String): Long {
-        val bookDir = File(booksDir, "epub-${UUID.randomUUID()}")
-        val result = EpubImporter().extract(file, bookDir)
+    private suspend fun importEpub(file: File, folder: File, fallbackTitle: String): Long {
+        val pagesDir = File(folder, "pages")
+        val result = EpubImporter().extract(file, pagesDir)
         if (result.chapters.isEmpty()) throw IOException("EPUB 中没有可读章节")
-        val cover = result.coverFile?.let { copyCover(it) }
+        val cover = toCoverPng(folder, result.coverFile)
         val now = System.currentTimeMillis()
         val chapters = result.chapters.mapIndexed { index, chapter ->
             ChapterEntity(
@@ -132,12 +143,12 @@ class BookImporter(
         }
         return library.insertBook(
             book = BookEntity(
-                title = result.title.ifBlank { title.ifBlank { "未命名书籍" } },
+                title = result.title.ifBlank { fallbackTitle.ifBlank { "未命名书籍" } },
                 author = result.author,
                 coverPath = cover?.absolutePath,
                 coverUrl = null,
                 sourceId = Book.LOCAL_SOURCE_ID,
-                url = bookDir.absolutePath,
+                url = folder.absolutePath,
                 description = result.description,
                 format = BookFormat.EPUB.name,
                 inLibrary = true,
@@ -150,22 +161,19 @@ class BookImporter(
         )
     }
 
-    private suspend fun importPdf(file: File, title: String): Long {
-        val dest = File(booksDir, "pdf-${UUID.randomUUID()}.pdf")
-        dest.parentFile?.mkdirs()
-        file.copyTo(dest, overwrite = true)
-
-        val coverOut = File(coversDir, "cover-${UUID.randomUUID()}.jpg")
-        val info = PdfImporter.inspect(dest, coverOut)
+    private suspend fun importPdf(file: File, folder: File, title: String): Long {
+        val coverTmp = File(folder, "cover-page.jpg")
+        val info = PdfImporter.inspect(file, coverTmp)
+        val cover = toCoverPng(folder, coverTmp)
         val now = System.currentTimeMillis()
         return library.insertBook(
             book = BookEntity(
                 title = title.ifBlank { "未命名书籍" },
                 author = null,
-                coverPath = info.coverFile?.absolutePath,
+                coverPath = cover?.absolutePath,
                 coverUrl = null,
                 sourceId = Book.LOCAL_SOURCE_ID,
-                url = dest.absolutePath,
+                url = file.absolutePath,
                 description = null,
                 format = BookFormat.PDF.name,
                 inLibrary = true,
@@ -178,13 +186,23 @@ class BookImporter(
         )
     }
 
-    private fun copyCover(source: File): File? = runCatching {
-        val extension = source.extension.ifBlank { "jpg" }
-        val dest = File(coversDir, "cover-${UUID.randomUUID()}.$extension")
-        dest.parentFile?.mkdirs()
-        source.copyTo(dest, overwrite = true)
-        dest
-    }.getOrNull()
+    /** 导入时拿到的封面统一转成 `<书目录>/cover.png`。 */
+    private fun toCoverPng(folder: File, source: File?): File? {
+        if (source == null || !source.exists()) return null
+        val target = source.inputStream().use { storage.writeCover(folder, it) }
+        if (target != null && source.absolutePath != target.absolutePath && source.parentFile == folder) {
+            source.delete()
+        }
+        return target ?: source
+    }
+
+    /** 用户手动换封面：写进 `<书目录>/cover.png`（远端书先建目录）。 */
+    suspend fun replaceCover(book: Book, uri: Uri): File? = withContext(Dispatchers.IO) {
+        val folder = storage.folderOf(book) ?: storage.bookFolder(book.title)
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            storage.writeCover(folder, input)
+        }
+    }
 
     private fun queryDisplayName(uri: Uri): String? = runCatching {
         context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)

@@ -26,6 +26,7 @@ enum class BookFormat(val label: String) {
 /** 来源类型。 */
 enum class SourceType(val label: String) {
     WEB("网页源"),
+    LEGADO("阅读书源"),
     OPDS("OPDS"),
     RSS("RSS"),
     LOCAL("本地"),

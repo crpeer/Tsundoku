@@ -7,7 +7,11 @@ import app.tsundoku.reader.data.local.AppDatabase
 import app.tsundoku.reader.data.net.NetworkClient
 import app.tsundoku.reader.data.prefs.SettingsRepository
 import app.tsundoku.reader.data.repo.LibraryRepository
+import app.tsundoku.reader.data.repo.UpdatesRepository
 import app.tsundoku.reader.data.source.SourceManager
+import app.tsundoku.reader.data.source.legado.LegadoImporter
+import app.tsundoku.reader.data.storage.BookStorage
+import app.tsundoku.reader.data.storage.MetadataSyncer
 import app.tsundoku.reader.domain.model.BookSourceInfo
 import app.tsundoku.reader.domain.model.RssConfig
 import app.tsundoku.reader.domain.model.SourceConfigs
@@ -29,7 +33,11 @@ class AppContainer(private val app: Application) {
     val library = LibraryRepository(database.bookDao(), database.chapterDao())
     val sources = SourceManager(database.sourceDao(), network)
     val settings = SettingsRepository(app)
-    val importer = BookImporter(app, library, network)
+    val storage = BookStorage(app)
+    val meta = MetadataSyncer(storage, library, settings)
+    val importer = BookImporter(app, library, network, storage, meta)
+    val legadoImporter = LegadoImporter(database.sourceDao())
+    val updates = UpdatesRepository(library, sources)
 
     /** 首次启动时放一个可用的示例订阅，避免空界面。 */
     suspend fun seedDemoSourceIfNeeded() {

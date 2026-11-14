@@ -19,6 +19,8 @@ class LibraryRepository(
     fun libraryBooks(): Flow<List<Book>> =
         bookDao.observeLibrary().map { list -> list.map { it.toModel() } }
 
+    suspend fun libraryBooksOnce(): List<Book> = bookDao.getLibrary().map { it.toModel() }
+
     fun book(id: Long): Flow<Book?> =
         bookDao.observeBook(id).map { it?.toModel() }
 

@@ -65,6 +65,10 @@ object RuleParser {
         if (raw.startsWith("http://") || raw.startsWith("https://") || raw.startsWith("file:")) return raw
         if (raw.startsWith("//")) return "https:$raw"
         val base = baseUrl?.takeIf { it.isNotBlank() } ?: return raw
-        return runCatching { URI(base).resolve(raw).toString() }.getOrDefault(raw)
+        // `https://host`（无路径）直接 resolve 相对地址会拼成 `https://hostfoo`，补个斜杠。
+        val normalized = if (base.substringAfter("://").contains('/')) base else "$base/"
+        // `{`/`}` 是非法 URI 字符，残留的 `{{...}}` 会让 URI 解析抛异常。
+        val safe = raw.replace("{", "%7B").replace("}", "%7D")
+        return runCatching { URI(normalized).resolve(safe).toString() }.getOrDefault(raw)
     }
 }
