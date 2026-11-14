@@ -186,8 +186,8 @@ class AddSourceViewModel(private val container: AppContainer) : ViewModel() {
             }
             result.onSuccess {
                 _state.update { it.copy(saving = false, done = true) }
-            }.onFailure {
-                _state.update { it.copy(saving = false, error = it.message ?: "保存失败") }
+            }.onFailure { error ->
+                _state.update { it.copy(saving = false, error = error.message ?: "保存失败") }
             }
         }
     }
