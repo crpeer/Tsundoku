@@ -1,0 +1,24 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+build/
+/app/build/
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Built artefacts
+*.apk
+*.aab
+*.keystore
+!debug.keystore
+
+# Local scratch files
+*.log
+build-probe*.txt
+
+# Room schemas are generated, keep the folder though
+/app/schemas/*.json
