@@ -27,6 +27,7 @@ import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -106,10 +107,35 @@ class LibraryViewModel(private val container: AppContainer) : ViewModel() {
         }
     }
 
-    fun remove(book: Book) {
+    fun remove(book: Book, keepMeta: Boolean) {
         viewModelScope.launch {
+            if (keepMeta) container.meta.keepFor(book) else container.meta.discardFor(book)
             container.library.delete(book.id)
-            message.value = "已移除《${book.title}》"
+            message.value = if (keepMeta) {
+                "已移除《${book.title}》，进度与批注已存成 meta.json"
+            } else {
+                "已移除《${book.title}》"
+            }
+        }
+    }
+
+    fun setCover(book: Book, uri: Uri) {
+        viewModelScope.launch {
+            val file = runCatching { container.importer.replaceCover(book, uri) }.getOrNull()
+            if (file == null) {
+                message.value = "封面更新失败"
+                return@launch
+            }
+            container.library.updateMeta(
+                bookId = book.id,
+                title = book.title,
+                author = book.author,
+                coverUrl = book.coverUrl,
+                coverPath = file.absolutePath,
+                description = book.description,
+            )
+            container.meta.sync(book.id)
+            message.value = "已更新封面"
         }
     }
 
@@ -133,10 +159,17 @@ fun LibraryScreen(
     var keyword by rememberSaveable { mutableStateOf("") }
     var menuBook by remember { mutableStateOf<Book?>(null) }
     var pendingDelete by remember { mutableStateOf<Book?>(null) }
+    var coverTarget by remember { mutableStateOf<Book?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) viewModel.import(uri)
+    }
+
+    val coverPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        val target = coverTarget
+        coverTarget = null
+        if (uri != null && target != null) viewModel.setCover(target, uri)
     }
 
     LaunchedEffect(message) {
@@ -271,6 +304,18 @@ fun LibraryScreen(
                 ),
             )
             ListItem(
+                headlineContent = { Text("更换封面") },
+                colors = ListItemDefaults.colors(containerColor = MaterialTheme.colorScheme.surface),
+                modifier = Modifier.combinedClickable(
+                    onClick = {
+                        coverTarget = book
+                        menuBook = null
+                        coverPicker.launch(arrayOf("image/*", "application/octet-stream"))
+                    },
+                    onLongClick = {},
+                ),
+            )
+            ListItem(
                 headlineContent = { Text("从书架移除") },
                 colors = ListItemDefaults.colors(containerColor = MaterialTheme.colorScheme.surface),
                 modifier = Modifier.combinedClickable(
@@ -286,13 +331,27 @@ fun LibraryScreen(
     }
 
     pendingDelete?.let { book ->
+        var keepMeta by remember(book.id) { mutableStateOf(true) }
         AlertDialog(
             onDismissRequest = { pendingDelete = null },
             title = { Text("移除书籍") },
-            text = { Text("确定要把《${book.title}》从书架移除吗？本地文件也会被删除。") },
+            text = {
+                Column {
+                    Text("确定要把《${book.title}》从书架移除吗？")
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(checked = keepMeta, onCheckedChange = { keepMeta = it })
+                        Text("保留阅读进度与批注（存成 meta.json）")
+                    }
+                    Text(
+                        text = "书籍文件与封面会留在 books/ 目录。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            },
             confirmButton = {
                 TextButton(onClick = {
-                    viewModel.remove(book)
+                    viewModel.remove(book, keepMeta)
                     pendingDelete = null
                 }) { Text("移除") }
             },

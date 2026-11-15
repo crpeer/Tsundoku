@@ -18,14 +18,20 @@ interface BookSource {
     /** 浏览。url 为 null 时加载首页；OPDS 用它做目录下钻。 */
     suspend fun browse(url: String? = null, page: Int = 1): List<SearchItem>
 
+    /** 分类入口（发现页的分类列表）。没有分类的来源返回空。 */
+    fun categories(): List<BrowseCategory> = emptyList()
+
     /** 获取书籍详情，用于补全作者/简介/封面。 */
     suspend fun details(url: String): BookDetails
 
     /** 获取章节目录。 */
     suspend fun chapters(bookUrl: String): List<ChapterItem>
 
-    /** 获取章节正文（HTML）。 */
+    /** 获取章节正文（HTML）。同一章节的多页由实现方合并后返回。 */
     suspend fun content(chapterUrl: String): String
 }
+
+/** 分类入口：名字 + 该分类第一页地址。 */
+data class BrowseCategory(val name: String, val url: String)
 
 class SourceException(message: String, cause: Throwable? = null) : Exception(message, cause)

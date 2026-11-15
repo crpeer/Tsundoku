@@ -2,14 +2,27 @@ package app.tsundoku.reader.data.import
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Element
+import org.jsoup.parser.Parser
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
 import java.net.URLDecoder
+import java.nio.file.Path
+import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 
 /**
  * EPUB 导入：把整本解包到私有目录，章节直接以本地 XHTML 文件路径保存，
  * 这样图片、CSS、脚注等资源都能被 WebView 正常加载。
+ *
+ * 安全约束（都是硬上限，超限直接失败并清理目标目录）：
+ * - 条目名必须是相对路径，且规范化后仍位于目标目录内（防 zip-slip）
+ * - 条目数 ≤ [MAX_ENTRIES]
+ * - 单个条目 ≤ [MAX_ENTRY_BYTES]
+ * - 解压总量 ≤ [MAX_TOTAL_BYTES]（防压缩炸弹）
  */
 class EpubImporter {
 
@@ -24,19 +37,28 @@ class EpubImporter {
     )
 
     suspend fun extract(epubFile: File, destDir: File): Result = withContext(Dispatchers.IO) {
+        try {
+            extractInternal(epubFile, destDir)
+        } catch (error: Throwable) {
+            // 失败时不留半成品，避免下次导入撞到脏目录
+            destDir.deleteRecursively()
+            throw error
+        }
+    }
+
+    private fun extractInternal(epubFile: File, destDir: File): Result {
         destDir.mkdirs()
         unzip(epubFile, destDir)
 
         val container = File(destDir, "META-INF/container.xml")
-        val opfPath = if (container.exists()) {
-            val doc = org.jsoup.Jsoup.parse(container.readText(), "", org.jsoup.parser.Parser.xmlParser())
-            doc.selectFirst("rootfile")?.attr("full-path")
-        } else null
-        if (opfPath.isNullOrBlank()) throw IOException("不是有效的 EPUB：缺少 container.xml")
+        if (!container.exists()) throw IOException("不是有效的 EPUB：缺少 META-INF/container.xml")
+        val containerDoc = Jsoup.parse(container.readText(), "", Parser.xmlParser())
+        val opfPath = containerDoc.selectFirst("rootfile")?.attr("full-path")
+        if (opfPath.isNullOrBlank()) throw IOException("不是有效的 EPUB：container.xml 缺少 rootfile")
 
-        val opfFile = File(destDir, opfPath)
+        val opfFile = resolveInside(destDir, opfPath)
         if (!opfFile.exists()) throw IOException("EPUB 缺少 OPF：$opfPath")
-        val opf = org.jsoup.Jsoup.parse(opfFile.readText(), "", org.jsoup.parser.Parser.xmlParser())
+        val opf = Jsoup.parse(opfFile.readText(), "", Parser.xmlParser())
         val opfDir = opfPath.substringBeforeLast('/', "")
 
         val title = firstText(opf, "dc:title", "title") ?: epubFile.nameWithoutExtension
@@ -72,7 +94,7 @@ class EpubImporter {
             ChapterFile(title = label, path = file.absolutePath)
         }
 
-        Result(
+        return Result(
             title = title,
             author = author,
             description = description,
@@ -82,13 +104,12 @@ class EpubImporter {
     }
 
     private fun readChapterTitle(file: File): String? = runCatching {
-        val html = file.readText()
-        org.jsoup.Jsoup.parse(html).selectFirst("title")?.text()?.trim()
+        Jsoup.parse(file.readText()).selectFirst("title")?.text()?.trim()
             ?.takeIf { it.isNotEmpty() }
     }.getOrNull()
 
     /** OPF 中的元数据标签带命名空间前缀（dc:title），按标签名逐个尝试。 */
-    private fun firstText(root: org.jsoup.nodes.Element, vararg tags: String): String? {
+    private fun firstText(root: Element, vararg tags: String): String? {
         for (tag in tags) {
             val text = runCatching {
                 root.getElementsByTag(tag).firstOrNull()?.text()?.trim()
@@ -99,30 +120,69 @@ class EpubImporter {
     }
 
     private fun unzip(archive: File, destDir: File) {
+        val root: Path = destDir.canonicalFile.toPath()
+        var totalBytes = 0L
+        var entryCount = 0
+
         ZipFile(archive).use { zip ->
-            zip.entries().asSequence().forEach { entry ->
-                val target = File(destDir, entry.name).canonicalFile
-                if (!target.path.startsWith(destDir.canonicalPath)) {
-                    throw IOException("非法的 EPUB 条目：${entry.name}")
+            for (entry in zip.entries()) {
+                if (++entryCount > MAX_ENTRIES) {
+                    throw IOException("EPUB 条目过多（> $MAX_ENTRIES），已中止导入")
                 }
-                if (entry.isDirectory) {
-                    target.mkdirs()
-                } else {
-                    target.parentFile?.mkdirs()
-                    zip.getInputStream(entry).use { input ->
-                        target.outputStream().use { output -> input.copyTo(output) }
-                    }
+                if (entry.isDirectory) continue
+
+                val name = entry.name.replace('\\', '/')
+                if (isAbsoluteEntry(name)) throw IOException("非法的 EPUB 条目：${entry.name}")
+
+                val target = root.resolve(name).normalize()
+                if (!target.startsWith(root)) throw IOException("非法的 EPUB 条目：${entry.name}")
+                if (entry.size > MAX_ENTRY_BYTES) {
+                    throw IOException("EPUB 条目过大：${entry.name}")
+                }
+
+                val file = target.toFile()
+                file.parentFile?.mkdirs()
+                val written = zip.getInputStream(entry).use { input ->
+                    file.outputStream().use { output -> copyLimited(input, output, entry.name) }
+                }
+                totalBytes += written
+                if (totalBytes > MAX_TOTAL_BYTES) {
+                    throw IOException("EPUB 解压后体积超限（> ${MAX_TOTAL_BYTES / 1024 / 1024} MB），已中止导入")
                 }
             }
         }
     }
 
+    /** 流式拷贝并限制单条大小，防止 zip 头里谎报 size 的炸弹。 */
+    private fun copyLimited(input: InputStream, output: OutputStream, name: String): Long {
+        val buffer = ByteArray(32 * 1024)
+        var written = 0L
+        while (true) {
+            val read = input.read(buffer)
+            if (read == -1) break
+            written += read
+            if (written > MAX_ENTRY_BYTES) throw IOException("EPUB 条目过大：$name")
+            output.write(buffer, 0, read)
+        }
+        return written
+    }
+
+    private fun isAbsoluteEntry(name: String): Boolean =
+        name.startsWith("/") || Regex("^[A-Za-z]:").containsMatchIn(name)
+
+    private fun resolveInside(root: File, href: String): File = resolveInside(root, "", href)
+
     private fun resolveInside(root: File, baseDir: String, href: String): File {
         val clean = URLDecoder.decode(href.substringBefore('#'), "UTF-8")
-        val candidate = File(File(root, baseDir), clean).canonicalFile
-        if (!candidate.path.startsWith(root.canonicalPath)) {
-            throw IOException("非法的 EPUB 路径：$href")
-        }
-        return candidate
+        val rootPath: Path = root.canonicalFile.toPath()
+        val candidate = rootPath.resolve(baseDir).resolve(clean).normalize()
+        if (!candidate.startsWith(rootPath)) throw IOException("非法的 EPUB 路径：$href")
+        return candidate.toFile()
+    }
+
+    companion object {
+        const val MAX_ENTRIES = 5_000
+        const val MAX_ENTRY_BYTES = 128L * 1024 * 1024
+        const val MAX_TOTAL_BYTES = 512L * 1024 * 1024
     }
 }

@@ -217,28 +217,24 @@ class BookDetailViewModel(
                 _state.update { it.copy(busy = false, message = "来源不可用") }
                 return@launch
             }
-            val items = runCatching { source.chapters(book.url) }.getOrDefault(emptyList())
-            if (items.isEmpty()) {
+            val items = runCatching { source.chapters(book.url) }.getOrNull()
+            if (items.isNullOrEmpty()) {
                 _state.update { it.copy(busy = false, message = "没有获取到章节") }
                 return@launch
             }
-            container.library.dropChaptersFrom(book.id, 0)
-            val now = System.currentTimeMillis()
-            container.library.saveChapters(
-                book.id,
-                items.map { item ->
-                    ChapterEntity(
-                        bookId = book.id,
-                        idx = item.index,
-                        title = item.title,
-                        url = item.url,
-                        content = null,
-                        read = false,
-                        updatedAt = now,
-                    )
-                },
-            )
-            _state.update { it.copy(busy = false, message = "目录已更新（${items.size} 章）") }
+            // 走合并而不是「全删重导」：保留已缓存正文、已读状态和阅读进度。
+            val merged = container.library.syncChapters(book.id, items)
+            val summary = if (merged == null) {
+                "目录已更新（${items.size} 章）"
+            } else {
+                buildString {
+                    append("目录已更新：共 ${merged.chapters.size} 章")
+                    if (merged.added > 0) append("，新增 ${merged.added}")
+                    if (merged.removed > 0) append("，移除 ${merged.removed}")
+                    if (merged.renamed > 0) append("，改名 ${merged.renamed}")
+                }
+            }
+            _state.update { it.copy(busy = false, message = summary) }
         }
     }
 

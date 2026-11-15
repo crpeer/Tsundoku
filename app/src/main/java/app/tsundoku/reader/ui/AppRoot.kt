@@ -6,12 +6,14 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Explore
 import androidx.compose.material.icons.outlined.LibraryBooks
 import androidx.compose.material.icons.outlined.MoreHoriz
+import androidx.compose.material.icons.outlined.Update
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -29,26 +31,37 @@ import app.tsundoku.reader.ui.browse.BrowseScreen
 import app.tsundoku.reader.ui.browse.SourceBrowseScreen
 import app.tsundoku.reader.ui.library.LibraryScreen
 import app.tsundoku.reader.ui.more.AddSourceScreen
+import app.tsundoku.reader.ui.more.ImportLegadoScreen
 import app.tsundoku.reader.ui.more.MoreScreen
+import app.tsundoku.reader.ui.more.SourceDiagnoseScreen
 import app.tsundoku.reader.ui.more.SourceManageScreen
 import app.tsundoku.reader.ui.reader.ReaderScreen
 import app.tsundoku.reader.ui.search.GlobalSearchScreen
+import app.tsundoku.reader.ui.updates.UpdatesScreen
 
 object Routes {
     const val LIBRARY = "library"
+    const val UPDATES = "updates"
     const val BROWSE = "browse"
     const val MORE = "more"
     const val BOOK = "book/{bookId}"
     const val READER = "reader/{bookId}?chapter={chapter}"
     const val SOURCE = "source/{sourceId}"
-    const val GLOBAL_SEARCH = "global_search"
+    const val GLOBAL_SEARCH = "global_search?q={q}"
     const val SOURCE_MANAGE = "source_manage"
+    const val SOURCE_DIAGNOSE = "source_diagnose/{sourceId}?name={name}"
     const val ADD_SOURCE = "add_source"
+    const val IMPORT_LEGADO = "import_legado"
     const val REMOTE = "remote?sourceId={sourceId}&url={url}&title={title}&cover={cover}&author={author}"
 
     fun book(id: Long) = "book/$id"
     fun reader(id: Long, chapter: Int = -1) = "reader/$id?chapter=$chapter"
     fun source(id: Long) = "source/$id"
+
+    fun globalSearch(keyword: String) = "global_search?q=${Uri.encode(keyword)}"
+
+    fun diagnose(sourceId: Long, name: String) =
+        "source_diagnose/$sourceId?name=${Uri.encode(name)}"
 
     fun remote(sourceId: Long, url: String, title: String, cover: String?, author: String?) =
         "remote?sourceId=$sourceId" +
@@ -62,16 +75,24 @@ private data class TopTab(val route: String, val label: String, val icon: ImageV
 
 private val topTabs = listOf(
     TopTab(Routes.LIBRARY, "书架", Icons.Outlined.LibraryBooks),
+    TopTab(Routes.UPDATES, "更新", Icons.Outlined.Update),
     TopTab(Routes.BROWSE, "发现", Icons.Outlined.Explore),
     TopTab(Routes.MORE, "更多", Icons.Outlined.MoreHoriz),
 )
 
 @Composable
-fun AppRoot(container: AppContainer) {
+fun AppRoot(container: AppContainer, initialSearchQuery: String? = null) {
     val navController = rememberNavController()
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route
     val showBottomBar = topTabs.any { it.route == currentRoute }
+
+    LaunchedEffect(initialSearchQuery) {
+        val keyword = initialSearchQuery?.trim().orEmpty()
+        if (keyword.isNotEmpty()) {
+            navController.navigate(Routes.globalSearch(keyword))
+        }
+    }
 
     Scaffold(
         bottomBar = {
@@ -109,10 +130,18 @@ fun AppRoot(container: AppContainer) {
                 )
             }
 
+            composable(Routes.UPDATES) {
+                UpdatesScreen(
+                    onOpenChapter = { bookId, chapter ->
+                        navController.navigate(Routes.reader(bookId, chapter))
+                    },
+                )
+            }
+
             composable(Routes.BROWSE) {
                 BrowseScreen(
                     onOpenSource = { navController.navigate(Routes.source(it)) },
-                    onGlobalSearch = { navController.navigate(Routes.GLOBAL_SEARCH) },
+                    onGlobalSearch = { navController.navigate(Routes.globalSearch("")) },
                     onAddSource = { navController.navigate(Routes.ADD_SOURCE) },
                     onManageSources = { navController.navigate(Routes.SOURCE_MANAGE) },
                 )
@@ -123,7 +152,12 @@ fun AppRoot(container: AppContainer) {
                     onAddSource = { navController.navigate(Routes.ADD_SOURCE) },
                     onManageSources = { navController.navigate(Routes.SOURCE_MANAGE) },
                     onOpenLibrary = { navController.navigate(Routes.LIBRARY) },
+                    onImportLegado = { navController.navigate(Routes.IMPORT_LEGADO) },
                 )
+            }
+
+            composable(Routes.IMPORT_LEGADO) {
+                ImportLegadoScreen(onBack = { navController.popBackStack() })
             }
 
             composable(
@@ -205,8 +239,14 @@ fun AppRoot(container: AppContainer) {
                 )
             }
 
-            composable(Routes.GLOBAL_SEARCH) {
+            composable(
+                route = Routes.GLOBAL_SEARCH,
+                arguments = listOf(
+                    navArgument("q") { type = NavType.StringType; defaultValue = "" },
+                ),
+            ) { entry ->
                 GlobalSearchScreen(
+                    initialQuery = entry.arguments?.getString("q"),
                     onBack = { navController.popBackStack() },
                     onOpenRemote = { source, item ->
                         navController.navigate(
@@ -226,6 +266,23 @@ fun AppRoot(container: AppContainer) {
                 SourceManageScreen(
                     onBack = { navController.popBackStack() },
                     onAddSource = { navController.navigate(Routes.ADD_SOURCE) },
+                    onDiagnose = { source ->
+                        navController.navigate(Routes.diagnose(source.id, source.name))
+                    },
+                )
+            }
+
+            composable(
+                route = Routes.SOURCE_DIAGNOSE,
+                arguments = listOf(
+                    navArgument("sourceId") { type = NavType.LongType },
+                    navArgument("name") { type = NavType.StringType; defaultValue = "" },
+                ),
+            ) { entry ->
+                SourceDiagnoseScreen(
+                    sourceId = entry.arguments?.getLong("sourceId") ?: -1L,
+                    sourceName = entry.arguments?.getString("name").orEmpty().ifBlank { "书源" },
+                    onBack = { navController.popBackStack() },
                 )
             }
 

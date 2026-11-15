@@ -141,6 +141,7 @@ class GlobalSearchViewModel(private val container: AppContainer) : ViewModel() {
 fun GlobalSearchScreen(
     onBack: () -> Unit,
     onOpenRemote: (BookSourceInfo, SearchItem) -> Unit,
+    initialQuery: String? = null,
 ) {
     val viewModel = appViewModel { GlobalSearchViewModel(it) }
     val query by viewModel.query.collectAsStateWithLifecycle()
@@ -151,6 +152,14 @@ fun GlobalSearchScreen(
 
     var autoSearch by remember { mutableStateOf(false) }
     val finished = results.count { it.status != GlobalSearchViewModel.Status.LOADING }
+
+    LaunchedEffect(initialQuery) {
+        val preset = initialQuery?.trim().orEmpty()
+        if (preset.isNotEmpty() && query.isBlank()) {
+            viewModel.onQueryChange(preset)
+            viewModel.search()
+        }
+    }
 
     LaunchedEffect(query) {
         if (autoSearch && query.isNotBlank()) {

@@ -6,8 +6,9 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -17,10 +18,12 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.FileDownload
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Source
+import androidx.compose.material.icons.outlined.UploadFile
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
@@ -31,6 +34,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
@@ -81,17 +85,22 @@ class MoreViewModel(private val container: AppContainer) : ViewModel() {
         viewModelScope.launch { container.settings.setTheme(theme) }
     }
 
+    fun setMetadataInBookDir(value: Boolean) {
+        viewModelScope.launch { container.settings.setMetadataInBookDir(value) }
+    }
+
     fun consumeMessage() {
         message.value = null
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun MoreScreen(
     onAddSource: () -> Unit,
     onManageSources: () -> Unit,
     onOpenLibrary: () -> Unit,
+    onImportLegado: () -> Unit,
 ) {
     val viewModel = appViewModel { MoreViewModel(it) }
     val settings by viewModel.settings.collectAsStateWithLifecycle()
@@ -163,6 +172,15 @@ fun MoreScreen(
                     modifier = Modifier.clickable(onClick = onAddSource),
                 )
             }
+
+            item {
+                ListItem(
+                    leadingContent = { Icon(Icons.Outlined.UploadFile, contentDescription = null) },
+                    headlineContent = { Text("导入阅读书源") },
+                    supportingContent = { Text("阅读 / Legado 的 bookSource JSON") },
+                    modifier = Modifier.clickable(onClick = onImportLegado),
+                )
+            }
             item {
                 ListItem(
                     leadingContent = { Icon(Icons.Outlined.Source, contentDescription = null) },
@@ -176,10 +194,29 @@ fun MoreScreen(
             item { SectionTitle("阅读设置", Modifier.padding(horizontal = 16.dp)) }
 
             item {
+                val inBookDir = settings.metadataInBookDir
+                ListItem(
+                    leadingContent = { Icon(Icons.Outlined.Description, contentDescription = null) },
+                    headlineContent = { Text("元数据位置") },
+                    supportingContent = {
+                        Text(if (inBookDir) "书籍目录 meta.json（可随书备份）" else "软件目录 meta/<id>.json")
+                    },
+                    trailingContent = {
+                        Switch(checked = inBookDir, onCheckedChange = { viewModel.setMetadataInBookDir(it) })
+                    },
+                )
+            }
+
+            item {
                 ListItem(
                     leadingContent = { Icon(Icons.Outlined.Settings, contentDescription = null) },
                     headlineContent = { Text("正文字号") },
-                    supportingContent = { Text("${settings.fontSize} px") },
+                    supportingContent = {
+                        Text(
+                            "${settings.fontSize} px · 行距 ${settings.lineHeight} · " +
+                                "段距 ${settings.paragraphSpacing} em · ${settings.writingMode.label}",
+                        )
+                    },
                     trailingContent = {
                         Slider(
                             value = settings.fontSize.toFloat(),
@@ -193,7 +230,7 @@ fun MoreScreen(
             }
 
             item {
-                Row(
+                FlowRow(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {

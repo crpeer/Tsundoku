@@ -4,10 +4,12 @@ import app.tsundoku.reader.data.local.SourceDao
 import app.tsundoku.reader.data.local.toEntity
 import app.tsundoku.reader.data.local.toModel
 import app.tsundoku.reader.data.net.NetworkClient
+import app.tsundoku.reader.data.source.legado.LegadoSource
 import app.tsundoku.reader.data.source.opds.OpdsSource
 import app.tsundoku.reader.data.source.rss.RssSource
 import app.tsundoku.reader.data.source.web.WebSource
 import app.tsundoku.reader.domain.model.BookSourceInfo
+import app.tsundoku.reader.domain.model.LegadoSourceConfig
 import app.tsundoku.reader.domain.model.OpdsConfig
 import app.tsundoku.reader.domain.model.RssConfig
 import app.tsundoku.reader.domain.model.SourceConfigs
@@ -29,6 +31,9 @@ class SourceManager(
     suspend fun enabledSources(): List<BookSourceInfo> =
         sourceDao.getEnabled().map { it.toModel() }
 
+    suspend fun sourcesOnce(): List<BookSourceInfo> =
+        sourceDao.getAll().map { it.toModel() }
+
     suspend fun add(info: BookSourceInfo): Long = sourceDao.insert(info.toEntity())
 
     suspend fun update(info: BookSourceInfo) = sourceDao.update(info.toEntity())
@@ -45,6 +50,10 @@ class SourceManager(
     fun build(info: BookSourceInfo): BookSource? = when (info.type) {
         SourceType.WEB -> runCatching {
             WebSource(info, SourceConfigs.json.decodeFromString<WebSourceConfig>(info.config), network)
+        }.getOrNull()
+
+        SourceType.LEGADO -> runCatching {
+            LegadoSource(info, SourceConfigs.json.decodeFromString<LegadoSourceConfig>(info.config), network)
         }.getOrNull()
 
         SourceType.OPDS -> runCatching {

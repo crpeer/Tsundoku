@@ -20,6 +20,8 @@ data class BookEntity(
     val inLibrary: Boolean,
     val lastReadAt: Long?,
     val lastChapterIndex: Int,
+    /** 当前章节内的位置：滚动模式的纵向偏移（CSS px），翻页模式的页码。 */
+    val lastPositionOffset: Int = 0,
     val pageCount: Int,
     val updatedAt: Long,
 )

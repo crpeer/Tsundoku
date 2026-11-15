@@ -11,10 +11,16 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val container = (application as TsundokuApp).container
+        val initialQuery = intent?.getStringExtra(EXTRA_SEARCH)
         setContent {
             TsundokuTheme {
-                AppRoot(container)
+                AppRoot(container = container, initialSearchQuery = initialQuery)
             }
         }
+    }
+
+    companion object {
+        /** 调试/自动化入口：`adb shell am start -n app.tsundoku.reader/.MainActivity --es q 关键字` */
+        const val EXTRA_SEARCH = "q"
     }
 }

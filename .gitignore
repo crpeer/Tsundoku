@@ -20,5 +20,5 @@ local.properties
 *.log
 build-probe*.txt
 
-# Room schemas are generated, keep the folder though
-/app/schemas/*.json
+
+# Room schemas are committed so migration tests have a baseline
