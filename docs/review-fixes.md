@@ -70,6 +70,58 @@
 - **测试**：`ContentPaginatorTest`（8 条：合并、环、上限、跨域、失败降级、空页、非法 scheme、同主机判定）
 - **未做**：只支持静态规则的 `nextContentUrl`，`@js:` 生成的分页地址不支持
 
+### 5b. 翻页模式页码与正文错位 —— 已修复（真机复现并验证）
+
+现象：左右翻页时页码从「第 11 页」变成「第 12 页」，但正文一动不动；章节较长或空行/分节标题多时更明显，末尾还会翻出空白页。
+
+排查结论（都是实测，不是推测）：
+
+1. **不是**「重组导致重复加载」——加日志统计「打开 1 次 + 翻 5 页」只发生 1 次 `loadDataWithBaseURL`。
+2. 真正的根因是**单位混用**：`WebView.contentHeight` 是 **CSS 像素**，`scrollY` / `width()` 是**物理像素**。
+   实测 `webView=720×1092 @1.75`，而 `innerWidth=clientWidth=1216`、`contentHeight=1313`（1216×1.75≈2128、1313×1.75≈2298）。
+   旧实现用 `column-width = 视口dp - 2*padding` 算列宽、用 `web.width` 当翻页步长，
+   两者根本不在一个坐标系里，于是「页码在涨、正文不动」，滚过最后一列还会出现空白页。
+3. `contentHeight` 在 `onPageFinished` 时经常是 **0**；`scrollTo(0, 1e7)` 也**不会**同步夹紧（实测读到 13104）。
+
+修复：翻页改成「按视口高度整页纵向滚动」，完全不用 CSS 多栏。
+
+- `ui/reader/PagerMath.kt`（新增，纯函数）：`pageCount` / `pageOf` / `pageOffset` / `targetPageScroll` / `ratio`，
+  全部只吃物理像素，输入是**实测的 maxScroll**
+- `ReaderWebView`：`maxScroll = computeVerticalScrollRange() - computeVerticalScrollExtent()`
+  （与 `scrollY` 同为物理像素）；布局稳定前 range==extent，所以 `onPageFinished` 后再补测一次（400 ms）
+- 页码 = `scrollY / 视口高`，最后一页固定落在 `maxScroll`，WebView 自己夹紧范围 ⇒ **不可能出现空白页**
+- `cssFor()` 翻页分支不再输出 `column-*`，并加 `pagedGuard` 用 `!important` 压住 EPUB 自带的
+  固定宽度/分栏/固定高度，只保留纵向滚动
+- `AndroidView.update` 增加 `loadKey`（正文+排版+视口）判断：只有它变了才 `loadDataWithBaseURL`，
+  普通重组不得重排；`beginLoad()` / `restorePass` / `settleRestore()` 保证还原完成前不上报位置，
+  避免「刚载入时的 0 位置」把记住的相对位置覆盖掉
+- 章末翻页：`turnPage()` 返回 false 才切章；往前翻回到上一章时用 `initialRatio = 1f` **落在章末**
+- 顺手修掉：设置/目录面板打开时返回键无效（`BackHandler(enabled = !showSettings && !showToc)`）
+
+测试：
+
+- `PagerMathTest`（9 条）：页码跟随滚动、最后一屏必须单独成页、遍历各种 maxScroll 断言
+  「一路翻到底正好停在 maxScroll」「每次只前进一屏」「不会翻过头」
+- `ReaderCssTest`（5 条）：翻页 CSS 不得出现具体列宽/列距、必须保留纵向滚动、不得固定页高
+- `TxtImporterTest` 新增 2 条：只有全角空格/不换行空格/制表符的行不算段落；一行一段
+
+真机验证（720×1600 @280dpi，TXT 2000 章 / EPUB 98 章 / 压力样例）：
+
+| 场景 | 结果 |
+| --- | --- |
+| big-book（TXT）第 8 章 | 1/3 → 2/3 → 3/3，每页正文都不同，3/3 是最后一行且不裁切 |
+| 3/3 再往后翻 | 进入第 9 章 1/3 |
+| 第 9 章 1/3 往回翻 | 回到第 8 章 **3/3** |
+| 字号 19→29px | 页数 3→5，位置按比例保留（第 2/3 页 → 第 3/5 页） |
+| 退出重进 | 回到离开时的章/页 |
+| EPUB 149228 第 1 章 | 1/11 → 5/11 → 11/11 → 第 2 章 1/10，无空白页 |
+| TXT 单个 3000 字长段落 | 16 页，逐页内容连贯 |
+| 连续 5/8 个空行 | 空行被丢弃，不留大段空白 |
+| 只有全角空格/nbsp 的 20 行 | 只剩一段正文，1 页 |
+
+**已知取舍**：因为按整屏滚动分页，页与页之间可能在屏幕顶端出现半行残字（滚动分屏的固有现象，
+不是漏字也不是重复）。要彻底消除需要按行盒测量排版（类似 Readium），本轮不引入。
+
 ### 6. 阅读进度 —— 已改进
 
 - 新增 `books.lastPositionOffset`（v2 迁移），读取时记住章节内位置

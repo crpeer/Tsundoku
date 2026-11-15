@@ -121,6 +121,20 @@ class TxtImporterTest {
     }
 
     @Test
+    fun whitespaceOnlyLinesNeverBecomeEmptyParagraphs() {
+        // 全角空格、不换行空格、制表符都算空行；否则会在分页里留下一屏空白
+        val html = TxtImporter.toHtml("甲\n\u3000\u3000\n\u00a0\n\t\n乙")
+        assertEquals("<div class=\"txt-body\"><p>甲</p><p>乙</p></div>", html)
+        assertTrue(!html.contains("<p></p>"))
+    }
+
+    @Test
+    fun oneLinePerParagraphForPagedLayout() {
+        val html = TxtImporter.toHtml("第一行\n第二行\n第三行")
+        assertEquals(3, Regex("<p>").findAll(html).count())
+    }
+
+    @Test
     fun htmlIsEscaped() {
         val html = TxtImporter.toHtml("<script>alert(1)</script>")
         assertTrue(html.contains("&lt;script&gt;"))

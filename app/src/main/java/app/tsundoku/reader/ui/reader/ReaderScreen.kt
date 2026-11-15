@@ -140,9 +140,16 @@ class ReaderViewModel(
     private val _initialOffset = MutableStateFlow(0)
     val initialOffset: StateFlow<Int> = _initialOffset.asStateFlow()
 
+    /** >= 0 时按相对位置打开（回溯到上一章时用它落在章末）。 */
+    private val _initialRatio = MutableStateFlow(-1f)
+    val initialRatio: StateFlow<Float> = _initialRatio.asStateFlow()
+
     private var loadJob: Job? = null
     private var saveJob: Job? = null
     private var currentOffset = 0
+
+    /** 下一次加载章节时要用的相对位置，消费一次就清空。 */
+    private var pendingRatio = -1f
 
     init {
         viewModelScope.launch {
@@ -186,7 +193,10 @@ class ReaderViewModel(
         goTo(_index.value + 1)
     }
 
+    /** 上一章：从章末开始，和纸质书往前翻的手感一致。 */
     fun previous() {
+        if (_index.value <= 0) return
+        pendingRatio = 1f
         goTo(_index.value - 1)
     }
 
@@ -314,6 +324,8 @@ class ReaderViewModel(
             // 只有重新进入上次读的那一章才恢复位置；否则从章首开始。
             currentOffset = if (index == current.lastChapterIndex) current.lastPositionOffset else 0
             _initialOffset.value = currentOffset
+            _initialRatio.value = pendingRatio
+            pendingRatio = -1f
             container.library.updateProgress(current.id, index, currentOffset)
 
             val stored = chapter.content
@@ -366,6 +378,7 @@ fun ReaderScreen(
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val message by viewModel.message.collectAsStateWithLifecycle()
     val initialOffset by viewModel.initialOffset.collectAsStateWithLifecycle()
+    val initialRatio by viewModel.initialRatio.collectAsStateWithLifecycle()
 
     var showToc by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
@@ -391,7 +404,8 @@ fun ReaderScreen(
     val scope = rememberCoroutineScope()
 
     // 退出前把当前位置写库，避免「看完就退」丢进度。
-    BackHandler {
+    // 目录/设置面板打开时要让位给面板自己的返回处理（否则返回键什么都关不掉）。
+    BackHandler(enabled = !showSettings && !showToc) {
         scope.launch {
             viewModel.flushPosition()
             onBack()
@@ -542,6 +556,7 @@ fun ReaderScreen(
                         readerSettings = settings,
                         theme = readerTheme,
                         initialOffset = initialOffset,
+                        initialRatio = initialRatio,
                         onPosition = viewModel::onPosition,
                         onPageChanged = { page, pages -> pageInfo = page to pages },
                         onEdgeTurn = { forward ->
@@ -828,6 +843,7 @@ private fun ChapterView(
     readerSettings: ReaderSettings,
     theme: ReaderTheme,
     initialOffset: Int,
+    initialRatio: Float,
     onPosition: (offset: Int, atEnd: Boolean) -> Unit,
     onPageChanged: (page: Int, pageCount: Int) -> Unit,
     onEdgeTurn: (forward: Boolean) -> Unit,
@@ -899,7 +915,16 @@ private fun ChapterView(
                         ): Boolean = true
 
                         override fun onPageFinished(view: WebView, url: String?) {
-                            (view as? ReaderWebView)?.applyRestore()
+                            val web = view as? ReaderWebView ?: return
+                            // 先测真实可滚动范围，再据此还原位置
+                            web.measureMaxScroll()
+                            web.applyRestore()
+                            // 图片/字体稍后加载会改变总高度，布局稳定后再测一次
+                            web.postDelayed({
+                                web.measureMaxScroll()
+                                web.settleRestore()
+                                web.publish()
+                            }, 400)
                         }
                     }
                     onOffset = { offset, atEnd, ratio ->
@@ -919,7 +944,8 @@ private fun ChapterView(
                     loadedKey[0] = loadKey
                     web.restoreOffset = lastOffset[0]
                     // 换字号/行距这类重排，用相对位置还原比绝对偏移更准
-                    web.restoreRatio = if (firstLoad) -1f else lastRatio[0]
+                    web.restoreRatio = if (firstLoad) initialRatio else lastRatio[0]
+                    web.beginLoad()
                     loadContent(web, html, localPath, style)
                 }
             },
@@ -999,8 +1025,8 @@ private fun loadContent(
 
 /**
  * 阅读器用的 WebView：
- * - 滚动模式上报 scrollY；翻页模式上报页码（scrollY / 视口高度）
- * - 翻页按视口高度整页滚动，由 WebView 自己钳制范围，不会翻出空白页
+ * - 滚动模式上报 scrollY；翻页模式上报页码
+ * - 翻页按视口高度整页滚动，范围由实测的 maxScroll 决定，不会翻出空白页
  * - 重新加载后恢复到上次位置
  */
 private class ReaderWebView(context: android.content.Context) : WebView(context) {
@@ -1016,48 +1042,106 @@ private class ReaderWebView(context: android.content.Context) : WebView(context)
 
     private val pageHeight: Int get() = height.coerceAtLeast(1)
 
+    /** 实测的最大滚动量（物理像素）。`contentHeight` 在 onPageFinished 时可能是 0，不可靠。 */
+    private var maxScroll: Int = 0
+    private var measuring: Boolean = false
+    private var restorePass: Int = 0
+    private var userMoved: Boolean = false
+    private var restored: Boolean = false
+
     override fun onScrollChanged(l: Int, t: Int, oldl: Int, oldt: Int) {
         super.onScrollChanged(l, t, oldl, oldt)
         publish()
     }
 
+    /**
+     * 真实可滚动范围（物理像素）。
+     *
+     * 不用 contentHeight：它是 CSS 像素（实测 1313 CSS px 对应 2297 物理像素），
+     * 也不用「滚到一个巨大偏移看被夹到哪里」：scrollTo 不会同步夹紧，会拿到垃圾值。
+     * computeVerticalScrollRange() / computeVerticalScrollExtent() 与 scrollY 同为物理像素。
+     */
+    private fun maxScrollY(): Int =
+        (computeVerticalScrollRange() - computeVerticalScrollExtent()).coerceAtLeast(0)
+
+    /** 重新测量并修正越界的滚动位置。布局稳定前 range 可能等于 extent，所以可以重复调用。 */
+    fun measureMaxScroll(): Int {
+        if (measuring) return maxScroll
+        maxScroll = maxScrollY()
+        if (scrollY > maxScroll) {
+            val target = maxScroll
+            measuring = true
+            scrollTo(scrollX, target)
+            measuring = false
+        }
+        return maxScroll
+    }
+
     fun publish() {
-        val ratio = PagerMath.ratio(scrollY, contentHeight, pageHeight)
+        // 还原完成前的位置都是「文档刚载入、尺寸还没测出来」的中间值，不能上报
+        if (measuring || !restored) return
+        // 每次上报都刷新真实范围：图片、字体加载完总高度会变
+        maxScroll = maxScrollY()
+        val ratio = PagerMath.ratio(scrollY, maxScroll)
+        val atEnd = PagerMath.isAtEnd(scrollY, maxScroll, if (pagedMode) 2 else 24)
         if (pagedMode) {
             onPage?.invoke(
-                PagerMath.pageOf(scrollY, contentHeight, pageHeight),
-                PagerMath.pageCount(contentHeight, pageHeight),
+                PagerMath.pageOf(scrollY, maxScroll, pageHeight),
+                PagerMath.pageCount(maxScroll, pageHeight),
             )
-            onOffset?.invoke(
-                PagerMath.pageOf(scrollY, contentHeight, pageHeight),
-                PagerMath.isAtEnd(scrollY, contentHeight, pageHeight),
-                ratio,
-            )
+            onOffset?.invoke(PagerMath.pageOf(scrollY, maxScroll, pageHeight), atEnd, ratio)
         } else {
-            onOffset?.invoke(scrollY, PagerMath.isAtEnd(scrollY, contentHeight, pageHeight, 24), ratio)
+            onOffset?.invoke(scrollY, atEnd, ratio)
         }
     }
 
     /** 翻一页；返回是否真的移动了（用于判断是否已到最后一页）。 */
-    fun turnPage(forward: Boolean): Boolean {
-        val before = scrollY
-        val target = PagerMath.targetPageScroll(before, forward, contentHeight, pageHeight)
-        scrollTo(scrollX, target)
-        publish()
-        return scrollY != before
+    /** 新文档开始加载：清掉上一份文档的还原状态。 */
+    fun beginLoad() {
+        restored = false
+        measuring = false
+        restorePass = 0
+        userMoved = false
     }
 
+    fun turnPage(forward: Boolean): Boolean {
+        if (measuring) return false
+        userMoved = true
+        maxScroll = maxScrollY()
+        val before = scrollY
+        val target = PagerMath.targetPageScroll(before, forward, maxScroll, pageHeight)
+        if (target == before) return false
+        scrollTo(scrollX, target)
+        // WebView 自己也会钳制；若仍没动说明确实到边了
+        if (scrollY == before) return false
+        publish()
+        return true
+    }
+
+    /**
+     * 还原阅读位置。
+     *
+     * 注意：onPageFinished 时布局往往还没稳定（range == extent，maxScroll 为 0），
+     * 这时算出的目标一定是 0，所以调用方要在布局稳定后再调用一次 settleRestore()。
+     */
     fun applyRestore() {
-        val max = PagerMath.maxScroll(contentHeight, pageHeight)
-        val target = when {
-            restoreRatio >= 0f -> PagerMath.offsetForRatio(restoreRatio, contentHeight, pageHeight)
-            pagedMode -> PagerMath.pageOffset(restoreOffset.coerceAtLeast(0), contentHeight, pageHeight)
-            else -> restoreOffset.coerceIn(0, max)
-        }
-        post {
-            scrollTo(scrollX, target)
-            publish()
-        }
+        restorePass++
+        val target = restoreTarget()
+        if (target != scrollY) scrollTo(scrollX, target)
+        restored = true
+        publish()
+    }
+
+    /** 布局稳定后校正一次位置；用户已经开始操作就不再打扰。 */
+    fun settleRestore() {
+        if (restorePass != 1 || userMoved) return
+        applyRestore()
+    }
+
+    private fun restoreTarget(): Int = when {
+        restoreRatio >= 0f -> PagerMath.offsetForRatio(restoreRatio, maxScroll)
+        pagedMode -> PagerMath.pageOffset(restoreOffset.coerceAtLeast(0), maxScroll, pageHeight)
+        else -> restoreOffset.coerceIn(0, maxScroll.coerceAtLeast(0))
     }
 }
 
