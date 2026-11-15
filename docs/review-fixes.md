@@ -118,40 +118,52 @@
 
 ## 四、本地导入
 
-### 11. TXT —— 未修复（记录问题与方案）
+### 11. TXT —— 已改为流式导入
 
-- 现状：`TxtImporter.readText()` 用 `file.readBytes()` 一次性读入，大文件（>50 MB）有内存风险。
-- 未改原因：需要把「编码嗅探 + 章节切分」改成流式管道，属独立改造，本轮不动以免引入回归。
-- 建议：按 4 MB 分块读取 → 用 BOM/UTF-8 校验/GBK 逐块解码 → 章节切分改为增量状态机。
+- 编码：只用**文件头 64 KB 样本**探测（BOM → 严格 UTF-8 → GBK），不再 `readBytes()` 整本读入
+  - 踩坑：一开始用 `sample.size < SAMPLE_BYTES` 判断「尾部截断」，导致小于 64 KB 的 GBK 文件被误判成 UTF-8；
+    现改为「去掉末尾 1–3 字节再试解码」
+  - BOM 残留：UTF-8 BOM 会让首行变成 `\uFEFF第一章` 导致标题不匹配，已在该行做 `trimStart('\uFEFF')`
+- 切分：`BufferedReader` 逐行读，内存里只保留**当前章节**；章节标题正则改为逐行 `matches()`
+- 写入：按 20 章一批回调，`BookImporter` 边收边写库（先建书记录，失败则连同空目录一起删掉）
+- 测试：`TxtImporterTest` 10 条（UTF-8/GBK/BOM/无章节/空文件/批量/CRLF/空行/转义/旧接口）
+- 实测：模拟器导入 2.71 MB、2000 章的 TXT，最终库里正好 **2000 章**（idx 0–1999）
 
-### 12. PDF —— 部分修复（记录问题）
+### 12. PDF —— 已改为「失败要报错」
 
-- 现状：`PdfImporter.inspect()` 用 `runCatching{}.getOrElse { pageCount = 0 }` **吞掉异常**，
-  损坏的 PDF 会被当成「导入成功但 0 页」。
-- 本轮改动：`BookImporter` 现在会在 `pageCount == 0` 时……（未做，仍按原行为导入，
-  阅读器打开时显示「无法打开这个 PDF 文件」）。
-- 待办：`inspect()` 应返回 `Result` 或在 `pageCount <= 0` 时抛 `IOException`，让导入失败可见。
+- `PdfImporter.inspect()` 不再 `runCatching{}.getOrElse { pageCount = 0 }`：
+  空文件 / 打不开 / `PdfRenderer` 构造失败 / 0 页，都会抛 `IOException` 并带上原因
+- `BookImporter.importPdf()` 遇到 `pageCount <= 0` 也会拒绝导入
+- 实测：推送一个 12 字节的假 PDF，导入提示
+  **「导入失败：PDF 解析失败，可能已损坏或加密：Unable to load the document!」**，书架没有多出任何书
+- 仍未处理：超大 PDF 的渲染内存（每页 bitmap ≈ 5 MB，Pager 同时保留 1–3 页），暂未做 LRU
 
-### 13. EPUB —— 部分改进
+### 13. EPUB —— 元数据兜底
 
-- 已修：路径安全、体积/条目上限、失败清理（见第 2 点）
-- 已确认正常：spine 顺序、manifest 资源、cover 优先级（`meta[name=cover]` → `properties=cover-image`）
-- 已知不足：`linear="no"` 的条目也会被当成章节；书名直接取 `dc:title`，
-  章节名直接取 XHTML `<title>`（像 `149228` 这类书标题就会很难看）
+- 书名：`dc:title` 是纯数字 / 全是分隔符 / 与文件名相同 / 含 untitled·未命名 时，回退到文件名
+- 章节名：`<title>` 与 `h1–h4` 都不可用时，统一给「第 N 章」
+  （原来这类书会显示 `1`、`2`、`3`；实测 `149228.epub` 现在显示 `第 1 章`、`第 2 章`…）
+- spine：`linear="no"` 的条目（脚注/版权页）不再进阅读顺序；若全书都是 no 才全部保留
+- 封面：manifest 里没有 cover 时，退一步用第一个 `image/*` 资源
+- 踩坑：判「垃圾标题」最初用了 `^[\d\s\W_]+$`，Java 的 `\W` 对中文恒为真，
+  会把「龙族」这类中文书名当垃圾；已改成显式的 `^[\d\s+_.\-]+$`
+- 测试：`EpubImporterTest` 共 9 条（含纯数字书名、纯数字章节名、全垃圾章节名、`linear=no`）
 
 ## 五、工程质量
 
 ### 14. 自动化测试
 
-新增 JVM 单测 47 条：
+新增 JVM 单测 **57 条**：
 
 | 文件 | 覆盖 |
 | --- | --- |
 | `RuleParserTest` | 文本/URL 语义、`||`、链式、坏规则 |
-| `EpubImporterTest` | 路径穿越、上限、清理、正常解包 |
+| `EpubImporterTest` | 路径穿越、上限、清理、正常解包、书名/章节名兜底、`linear=no` |
+| `TxtImporterTest` | UTF-8/GBK/BOM 识别、流式分批、CRLF、空文件、HTML 转义 |
 | `DatabaseBackupsTest` | 升级备份、侧车文件、保留份数、迁移完整性 |
 | `ChapterMergeTest` | 目录同步的数据保留 |
 | `ContentPaginatorTest` | 正文分页的合并与防护 |
+| `LegadoExploreTest` | `exploreUrl` 解析 |
 | `LegadoProbeTest` | 离线规则用例 + 可选联网巡检 |
 
 > 注意：工程路径含中文时 Gradle 单测 worker 会报 `ClassNotFoundException`，
@@ -159,7 +171,8 @@
 
 ### 15. 代码结构
 
-- 把「合并逻辑」「分页逻辑」「备份逻辑」抽成纯函数/纯类，可直接单测
+- 把「合并逻辑」「分页逻辑」「备份逻辑」「编码探测」抽成纯函数/纯类，可直接单测
 - `LibraryRepository` 通过构造参数注入事务执行器，避免直接依赖 `AppDatabase`
+- `TxtImporter` 改成「回调式流式 API」，`BookImporter` 只负责建书 + 分批写库
 - 仍然存在的问题（未改）：`BookDetailScreen` 的 ViewModel 里混着加入书架/刷新目录等业务编排；
   `NetworkClient` 用的是阻塞 `execute()`，协程取消不会中断请求
