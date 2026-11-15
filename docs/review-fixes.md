@@ -228,3 +228,39 @@
 - `TxtImporter` 改成「回调式流式 API」，`BookImporter` 只负责建书 + 分批写库
 - 仍然存在的问题（未改）：`BookDetailScreen` 的 ViewModel 里混着加入书架/刷新目录等业务编排；
   `NetworkClient` 用的是阻塞 `execute()`，协程取消不会中断请求
+
+## 六、Readers 功能对齐（参考 Readest / Legado / Mihon）
+
+### 批次一：分页引擎 + 翻页交互 —— 已完成
+
+上一版用「按视口高度整页滚动」分页，页边界会把最后一行切成两半（页 1 显示半行、页 2 再完整显示一次）。
+现在改为 **CSS 多栏 + 根元素横向滚动**（与 Readest / foliate-js 相同）：
+
+- `ui/reader/ReaderScript.kt`：注入脚本，负责分栏、测量、翻页、点击区域、手势
+- `ui/reader/PaginationBridge.kt`：`@JavascriptInterface` 桥，只暴露整数/布尔参数的方法
+- 多栏必须设在 `documentElement` 上；设在 body 或普通 `div` 上时列溢出会被裁掉
+  （实测 `scrollWidth` 恒等于视口宽，`pages` 恒为 1）
+- 视口尺寸由 Kotlin 侧量好写进 `viewport meta` 与脚本：实测同一设备上
+  `window.innerWidth` / `documentElement.clientWidth` 会给出 **412 与 1628** 两种值，
+  导致整章被判成一页、页数与正文完全脱节
+- 页码 = `scrollLeft / 栏宽`；栏宽 + 列距 = 视口宽 ⇒ `页数 = ceil(scrollWidth / 视口宽)`
+- 多栏在布局阶段就不拆行盒 ⇒ 不会出现半行残字，也不会重复显示
+
+安全：加载正文前用 `sanitizeForScript()` 去掉 EPUB 自带的 `<script>` 与内联事件属性，
+脚本只能调用桥上的整数方法，拿不到文件/网络。
+
+新增交互：6 种点击区域（三栏 / L 形 / Kindle 式 / 边缘 / 左右两栏 / 禁用）、
+音量键翻页（`Activity.dispatchKeyEvent` 派发，避免 WebView 抢焦点后收不到）、
+翻页动画（无 / 滑动 / 覆盖 / 淡入，用 WebView 快照实现）、字间距 / 词间距 / 两端对齐、
+中键显隐上下栏。
+
+实测（720x1600@280dpi，TXT 3000 字单段）：1/17 → 2/17 页首为完整行、页尾无半行；
+17/17 是章末且无空白页；再往前翻进入下一章；章首往回回到上一章末页；音量键可翻页。
+
+竖排仍只支持滚动模式：多栏的栏轴与横排相反，需要单独处理。
+
+### 后续批次（计划）
+
+- 批次二：批注 / 高亮 / 笔记、书签、全文搜索、目录增强（Room 迁移 + 选词交互）
+- 批次三：简繁转换、引号替换、净化正则、页眉页脚、底部进度滑块、自动滚动、TTS
+- 批次四：书架分组 / 列表视图、详情页章节状态、阅读器底部控制条（Mihon 化）
