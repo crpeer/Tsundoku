@@ -42,35 +42,35 @@ class ReaderCssTest {
     )
 
     @Test
-    fun pagedCssDoesNotUseMultiColumnLayout() {
+    fun pagedCssLeavesColumnsToTheScript() {
         val paged = css(ReaderLayout.PAGED)
-        // column-width/column-gap 只允许以 auto/normal 的形式出现在「压制」规则里
-        assertFalse(paged.contains("column-width: 3"))
-        assertFalse(paged.contains("column-gap: 40"))
-        assertTrue(paged.contains("-webkit-column-width: auto !important"))
-        assertTrue(paged.contains("-webkit-column-gap: normal !important"))
+        // 分栏由 ReaderScript 用行内样式设置；CSS 里若用 !important 压 column-* 会把分栏关掉
+        assertFalse(paged.contains("column-width: auto !important"))
+        assertFalse(paged.contains("column-count: auto"))
+        assertFalse(paged.contains("column-gap: normal !important"))
     }
 
     @Test
-    fun pagedCssKeepsVerticalScrollingEnabled() {
+    fun pagedCssLeavesScrollingToTheInjectedView() {
         val paged = css(ReaderLayout.PAGED)
-        assertTrue(paged.contains("overflow-y: auto !important"))
-        assertTrue(paged.contains("overflow-x: hidden !important"))
+        // 滚动容器由脚本注入的 #tsu-view 负责，CSS 不能抢
+        assertTrue(paged.contains("#tsu-view"))
+        assertFalse(paged.contains("html { overflow-x: auto"))
     }
 
     @Test
     fun pagedCssNeverFixesPageHeight() {
         val paged = css(ReaderLayout.PAGED)
-        // 固定高度会把内容裁掉，翻页位置就与正文对不上了
-        assertTrue(paged.contains("height: auto !important"))
+        // 高度由脚本按视口设置，CSS 里不能写死
+        assertFalse(paged.contains("height: auto !important"))
         assertFalse(paged.contains("height: 1200px"))
     }
 
     @Test
     fun scrollCssHasNoPagedGuard() {
         val scroll = css(ReaderLayout.SCROLL)
-        assertFalse(scroll.contains("overflow-y: auto !important"))
-        assertFalse(scroll.contains("-webkit-column-width: auto !important"))
+        assertFalse(scroll.contains("#tsu-view"))
+        assertFalse(scroll.contains("column-width: auto"))
         // 滚动模式底部留白，避免最后一行贴着屏幕边缘
         assertTrue(scroll.contains("padding: 8px 20px 64px 20px"))
     }
