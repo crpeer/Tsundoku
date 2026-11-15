@@ -10,7 +10,7 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -61,6 +61,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -425,7 +426,7 @@ fun ReaderScreen(
                             } else {
                                 val base = "${index + 1} / ${chapters.size}"
                                 if (settings.layout == ReaderLayout.PAGED) {
-                                    "$base · 第 ${pageInfo.first + 1} 页"
+                                    "$base · 第 ${pageInfo.first + 1} / ${pageInfo.second} 页"
                                 } else {
                                     base
                                 }
@@ -543,6 +544,9 @@ fun ReaderScreen(
                         initialOffset = initialOffset,
                         onPosition = viewModel::onPosition,
                         onPageChanged = { page, pages -> pageInfo = page to pages },
+                        onEdgeTurn = { forward ->
+                            if (forward) viewModel.next() else viewModel.previous()
+                        },
                         modifier = Modifier.fillMaxSize(),
                     )
                 }
@@ -733,7 +737,7 @@ private fun <T> SettingChips(
     }
 }
 
-private fun cssFor(
+internal fun cssFor(
     theme: ReaderTheme,
     s: ReaderSettings,
     viewWidthPx: Int,
@@ -744,16 +748,12 @@ private fun cssFor(
     val paged = s.layout == ReaderLayout.PAGED && !vertical
     val blockFlow = when {
         paged -> {
-            // 一列 = 一页：列宽 = 可视宽度 - 2*pad，列间距 = 2*pad，所以翻页步长正好等于可视宽度。
+            // 翻页模式用的是「按视口高度整页纵向滚动」，**不能**再套 CSS 多栏：
+            // 列宽依赖 CSS px 与 dp 的换算，实测两者不成 1:1，会导致页码与正文错位、
+            // 甚至滚过内容末尾出现空白页。这里保持正常流式排版，由 PagerMath 负责分页。
             """
-            html { overflow-x: auto; overflow-y: hidden; }
             body {
-              height: ${viewHeightPx}px;
-              padding: 8px ${pad}px;
-              box-sizing: border-box;
-              column-width: ${(viewWidthPx - pad * 2).coerceAtLeast(120)}px;
-              column-gap: ${pad * 2}px;
-              column-fill: auto;
+              padding: 8px ${pad}px 8px ${pad}px;
             }
             """.trimIndent()
         }
@@ -776,7 +776,27 @@ private fun cssFor(
     } else {
         "img, video, svg { max-width: 100%; height: auto; }"
     }
-    val breakRule = if (paged) "h1, h2, h3 { break-after: avoid; }" else ""
+    // 翻页模式下必须压住 EPUB 自带的固定宽度/分栏，否则内容会溢出页面、页码与实际位置脱节。
+    val pagedGuard = if (paged) {
+        """
+        html, body {
+          -webkit-column-count: auto !important;
+          column-count: auto !important;
+          -webkit-column-width: auto !important;
+          column-width: auto !important;
+          -webkit-column-gap: normal !important;
+          column-gap: normal !important;
+          width: auto !important;
+          max-width: 100% !important;
+          height: auto !important;
+        }
+        html { overflow-x: hidden !important; overflow-y: auto !important; }
+        body { overflow: visible !important; }
+        img, svg, video, table, pre { max-width: 100% !important; }
+        """.trimIndent()
+    } else {
+        ""
+    }
     return """
     html, body {
       margin: 0;
@@ -791,10 +811,10 @@ private fun cssFor(
       word-wrap: break-word;
     }
     $blockFlow
+    $pagedGuard
     p { margin: 0 0 ${s.paragraphSpacing}em 0; text-indent: ${s.textIndent}em; }
     $media
     h1, h2, h3 { line-height: 1.45; margin: 1em 0 0.6em; }
-    $breakRule
     a { color: inherit; }
     pre { white-space: pre-wrap; }
 """.trimIndent()
@@ -810,19 +830,51 @@ private fun ChapterView(
     initialOffset: Int,
     onPosition: (offset: Int, atEnd: Boolean) -> Unit,
     onPageChanged: (page: Int, pageCount: Int) -> Unit,
+    onEdgeTurn: (forward: Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     BoxWithConstraints(modifier = modifier) {
-        // CSS px == dp here (viewport meta width=device-width, initial-scale=1), so the measured
-        // size in dp is directly usable as a CSS length.
         val viewWidthPx = maxWidth.value.roundToInt().coerceAtLeast(1)
         val viewHeightPx = maxHeight.value.roundToInt().coerceAtLeast(1)
         val paged = readerSettings.layout == ReaderLayout.PAGED &&
             readerSettings.writingMode != ReaderWritingMode.VERTICAL
 
-        // 非 Compose 状态：记录当前偏移，供「设置变更后重新加载」时回到原处。
+        // 非 Compose 状态：记录当前偏移/相对位置，供「设置变更后重新加载」时回到原处。
         val lastOffset = remember(localPath, html) { intArrayOf(initialOffset.coerceAtLeast(0)) }
+        val lastRatio = remember(localPath, html) { floatArrayOf(0f) }
+        // 上一次真正加载时用的 key：只有它变了才允许重新 loadData。
+        val loadedKey = remember(localPath, html) { arrayOfNulls<String>(1) }
         var webRef by remember { mutableStateOf<ReaderWebView?>(null) }
+
+        val positionCb = rememberUpdatedState(onPosition)
+        val pageCb = rememberUpdatedState(onPageChanged)
+        val edgeCb = rememberUpdatedState(onEdgeTurn)
+
+        // 正文 / 排版 / 视口任何一项变化才需要重新排版，普通重组（例如页码变化）不得重排。
+        val loadKey = remember(
+            localPath,
+            html,
+            theme,
+            readerSettings,
+            viewWidthPx,
+            viewHeightPx,
+        ) {
+            listOf(
+                localPath ?: html?.hashCode()?.toString() ?: "empty",
+                theme.name,
+                readerSettings.fontSize,
+                readerSettings.fontFamily,
+                readerSettings.fontWeight,
+                readerSettings.lineHeight,
+                readerSettings.paragraphSpacing,
+                readerSettings.textIndent,
+                readerSettings.horizontalPadding,
+                readerSettings.writingMode,
+                readerSettings.layout,
+                viewWidthPx,
+                viewHeightPx,
+            ).joinToString("|")
+        }
 
         AndroidView(
             modifier = Modifier
@@ -836,6 +888,8 @@ private fun ChapterView(
                     settings.textZoom = 100
                     settings.setSupportZoom(false)
                     settings.builtInZoomControls = false
+                    isVerticalScrollBarEnabled = false
+                    isHorizontalScrollBarEnabled = false
                     setBackgroundColor(android.graphics.Color.TRANSPARENT)
                     // 阅读器不应该能把用户带出当前章节（点外链/广告位）
                     webViewClient = object : WebViewClient() {
@@ -848,53 +902,25 @@ private fun ChapterView(
                             (view as? ReaderWebView)?.applyRestore()
                         }
                     }
-                    onOffset = { offset, atEnd ->
+                    onOffset = { offset, atEnd, ratio ->
                         lastOffset[0] = offset
-                        onPosition(offset, atEnd)
+                        lastRatio[0] = ratio
+                        positionCb.value(offset, atEnd)
                     }
-                    onPage = { page, pages -> onPageChanged(page, pages) }
+                    onPage = { page, pages -> pageCb.value(page, pages) }
                 }.also { webRef = it }
             },
             update = { web ->
                 val style = cssFor(theme, readerSettings, viewWidthPx, viewHeightPx)
                 web.pagedMode = paged
-                web.restoreOffset = lastOffset[0]
-            when {
-                localPath != null -> {
-                    val file = File(localPath)
-                    val raw = runCatching { file.readText() }.getOrNull()
-                    if (raw != null) {
-                        val meta = "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-                        val injected = if (raw.contains("</head>", ignoreCase = true)) {
-                            raw.replaceFirst(
-                                "</head>",
-                                "$meta<style>$style</style></head>",
-                                ignoreCase = true,
-                            )
-                        } else {
-                            "$meta<style>$style</style>$raw"
-                        }
-                        web.loadDataWithBaseURL(
-                            "file://${file.parentFile?.absolutePath}/",
-                            injected,
-                            "text/html",
-                            "utf-8",
-                            null,
-                        )
-                    }
-                }
-
-                html != null -> web.loadDataWithBaseURL(
-                    null,
-                    "<!doctype html><html><head><meta charset=\"utf-8\">" +
-                        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
-                        "<style>$style</style></head><body>$html</body></html>",
-                    "text/html",
-                    "utf-8",
-                    null,
-                )
-
-                else -> Unit
+                // 关键：只有 loadKey 变了才重新加载文档。
+                if (loadedKey[0] != loadKey) {
+                    val firstLoad = loadedKey[0] == null
+                    loadedKey[0] = loadKey
+                    web.restoreOffset = lastOffset[0]
+                    // 换字号/行距这类重排，用相对位置还原比绝对偏移更准
+                    web.restoreRatio = if (firstLoad) -1f else lastRatio[0]
+                    loadContent(web, html, localPath, style)
                 }
             },
         )
@@ -903,27 +929,29 @@ private fun ChapterView(
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .pointerInput(viewWidthPx) {
-                        var dragged = 0f
-                        detectHorizontalDragGestures(
-                            onDragStart = { dragged = 0f },
-                            onDragEnd = {
-                                val web = webRef ?: return@detectHorizontalDragGestures
-                                val step = web.width.coerceAtLeast(1)
-                                val before = web.scrollX
-                                when {
-                                    dragged <= -40f -> web.scrollBy(step, 0)
-                                    dragged >= 40f -> web.scrollBy(-step, 0)
-                                    else -> return@detectHorizontalDragGestures
-                                }
-                                web.post {
-                                    val page = (web.scrollX / step).coerceAtLeast(0)
-                                    // 往前翻却纹丝不动 = 已经在最后一页，本章读完
-                                    val atEnd = dragged <= -40f && web.scrollX == before
-                                    web.publishPosition(page, atEnd)
-                                }
+                    .pointerInput(Unit) {
+                        var totalX = 0f
+                        var totalY = 0f
+                        detectDragGestures(
+                            onDragStart = {
+                                totalX = 0f
+                                totalY = 0f
                             },
-                            onHorizontalDrag = { _, amount -> dragged += amount },
+                            onDragEnd = {
+                                val web = webRef ?: return@detectDragGestures
+                                val horizontal = kotlin.math.abs(totalX) >= kotlin.math.abs(totalY)
+                                val forward = if (horizontal) totalX <= -40f else totalY <= -40f
+                                val backward = if (horizontal) totalX >= 40f else totalY >= 40f
+                                // 翻到章末/章首时仍翻不动，才算越过章节边界
+                                if (forward && !web.turnPage(forward = true)) edgeCb.value(true)
+                                if (backward && !web.turnPage(forward = false)) edgeCb.value(false)
+                            },
+                            onDrag = { change, dragAmount ->
+                                // 翻页模式下禁止让 WebView 自己滚动，否则会出现半页/空白页
+                                change.consume()
+                                totalX += dragAmount.x
+                                totalY += dragAmount.y
+                            },
                         )
                     },
             )
@@ -931,40 +959,104 @@ private fun ChapterView(
     }
 }
 
+/** 把正文塞进 WebView（EPUB 用本地文件，网页/TXT 用内存 HTML）。 */
+private fun loadContent(
+    web: WebView,
+    html: String?,
+    localPath: String?,
+    style: String,
+) {
+    when {
+        localPath != null -> {
+            val file = File(localPath)
+            val raw = runCatching { file.readText() }.getOrNull() ?: return
+            val meta = "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+            val injected = if (raw.contains("</head>", ignoreCase = true)) {
+                raw.replaceFirst("</head>", "$meta<style>$style</style></head>", ignoreCase = true)
+            } else {
+                "$meta<style>$style</style>$raw"
+            }
+            web.loadDataWithBaseURL(
+                "file://${file.parentFile?.absolutePath}/",
+                injected,
+                "text/html",
+                "utf-8",
+                null,
+            )
+        }
+
+        html != null -> web.loadDataWithBaseURL(
+            null,
+            "<!doctype html><html><head><meta charset=\"utf-8\">" +
+                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
+                "<style>$style</style></head><body>$html</body></html>",
+            "text/html",
+            "utf-8",
+            null,
+        )
+    }
+}
+
 /**
  * 阅读器用的 WebView：
- * - 滚动时上报位置（滚动模式 = scrollY，翻页模式 = 页码）
- * - 重新加载后恢复到上次位置（换字号/主题不会丢失阅读位置）
+ * - 滚动模式上报 scrollY；翻页模式上报页码（scrollY / 视口高度）
+ * - 翻页按视口高度整页滚动，由 WebView 自己钳制范围，不会翻出空白页
+ * - 重新加载后恢复到上次位置
  */
 private class ReaderWebView(context: android.content.Context) : WebView(context) {
 
     var pagedMode: Boolean = false
     var restoreOffset: Int = 0
-    var onOffset: ((offset: Int, atEnd: Boolean) -> Unit)? = null
+
+    /** >= 0 时按相对位置还原（换字号/行距后的重排更准）。 */
+    var restoreRatio: Float = -1f
+
+    var onOffset: ((offset: Int, atEnd: Boolean, ratio: Float) -> Unit)? = null
     var onPage: ((page: Int, pageCount: Int) -> Unit)? = null
+
+    private val pageHeight: Int get() = height.coerceAtLeast(1)
 
     override fun onScrollChanged(l: Int, t: Int, oldl: Int, oldt: Int) {
         super.onScrollChanged(l, t, oldl, oldt)
-        val step = width.coerceAtLeast(1)
+        publish()
+    }
+
+    fun publish() {
+        val ratio = PagerMath.ratio(scrollY, contentHeight, pageHeight)
         if (pagedMode) {
-            publishPosition((scrollX / step).coerceAtLeast(0), false)
+            onPage?.invoke(
+                PagerMath.pageOf(scrollY, contentHeight, pageHeight),
+                PagerMath.pageCount(contentHeight, pageHeight),
+            )
+            onOffset?.invoke(
+                PagerMath.pageOf(scrollY, contentHeight, pageHeight),
+                PagerMath.isAtEnd(scrollY, contentHeight, pageHeight),
+                ratio,
+            )
         } else {
-            val atEnd = contentHeight > 0 && scrollY + height >= contentHeight - 24
-            onOffset?.invoke(scrollY, atEnd)
+            onOffset?.invoke(scrollY, PagerMath.isAtEnd(scrollY, contentHeight, pageHeight, 24), ratio)
         }
     }
 
-    fun publishPosition(page: Int, atEnd: Boolean) {
-        onPage?.invoke(page, 0)
-        onOffset?.invoke(page, atEnd)
+    /** 翻一页；返回是否真的移动了（用于判断是否已到最后一页）。 */
+    fun turnPage(forward: Boolean): Boolean {
+        val before = scrollY
+        val target = PagerMath.targetPageScroll(before, forward, contentHeight, pageHeight)
+        scrollTo(scrollX, target)
+        publish()
+        return scrollY != before
     }
 
     fun applyRestore() {
-        val step = width.coerceAtLeast(1)
-        val target = restoreOffset.coerceAtLeast(0)
-        if (pagedMode) scrollTo(target * step, 0) else scrollTo(0, target)
+        val max = PagerMath.maxScroll(contentHeight, pageHeight)
+        val target = when {
+            restoreRatio >= 0f -> PagerMath.offsetForRatio(restoreRatio, contentHeight, pageHeight)
+            pagedMode -> PagerMath.pageOffset(restoreOffset.coerceAtLeast(0), contentHeight, pageHeight)
+            else -> restoreOffset.coerceIn(0, max)
+        }
         post {
-            if (pagedMode) publishPosition((scrollX / step).coerceAtLeast(0), false)
+            scrollTo(scrollX, target)
+            publish()
         }
     }
 }

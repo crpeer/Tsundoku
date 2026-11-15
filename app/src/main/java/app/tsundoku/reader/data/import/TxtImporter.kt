@@ -66,7 +66,8 @@ object TxtImporter {
     fun toHtml(body: String): String = buildString {
         append("<div class=\"txt-body\">")
         body.split('\n').forEach { rawLine ->
-            val line = rawLine.trim()
+            // 中文 TXT 里常见全角空格和不换行空格，只按 isWhitespace 判断会留下「空段落」
+            val line = rawLine.trim { it.isWhitespace() || it == '\u00a0' || it == '\uFEFF' }
             if (line.isNotEmpty()) {
                 append("<p>")
                 append(escape(line))
