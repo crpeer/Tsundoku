@@ -18,12 +18,27 @@ data class LegadoSourceConfig(
     @SerialName("bookSourceComment") val comment: String = "",
     @SerialName("enabled") val enabled: Boolean = true,
     @SerialName("searchUrl") val searchUrl: String = "",
+    @SerialName("exploreUrl") val exploreUrl: String = "",
     @SerialName("header") val header: String = "",
     @SerialName("loginUrl") val loginUrl: String = "",
     @SerialName("ruleSearch") val search: LegadoSearchRule = LegadoSearchRule(),
+    @SerialName("ruleExplore") val explore: LegadoExploreRule = LegadoExploreRule(),
     @SerialName("ruleBookInfo") val bookInfo: LegadoBookInfoRule = LegadoBookInfoRule(),
     @SerialName("ruleToc") val toc: LegadoTocRule = LegadoTocRule(),
     @SerialName("ruleContent") val content: LegadoContentRule = LegadoContentRule(),
+)
+
+@Serializable
+data class LegadoExploreRule(
+    val bookList: String = "",
+    val name: String = "",
+    val author: String = "",
+    val intro: String = "",
+    val kind: String = "",
+    val lastChapter: String = "",
+    val wordCount: String = "",
+    val coverUrl: String = "",
+    val bookUrl: String = "",
 )
 
 @Serializable

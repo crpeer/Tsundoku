@@ -46,10 +46,16 @@ class BookImporter(
         val format = BookFormat.fromName(safeName)
         val local = File(folder, "book.${safeName.substringAfterLast('.', "txt")}")
         if (file.absolutePath != local.absolutePath) file.copyTo(local, overwrite = true)
-        val bookId = when (format) {
-            BookFormat.EPUB -> importEpub(local, folder, title)
-            BookFormat.PDF -> importPdf(local, folder, title)
-            else -> importTxt(local, title)
+        val bookId = try {
+            when (format) {
+                BookFormat.EPUB -> importEpub(local, folder, title)
+                BookFormat.PDF -> importPdf(local, folder, title)
+                else -> importTxt(local, title)
+            }
+        } catch (error: Throwable) {
+            // 导入失败不留空书目录
+            folder.deleteRecursively()
+            throw error
         }
         if (file.parentFile == context.cacheDir) file.delete()
         syncer.sync(bookId)
@@ -164,6 +170,10 @@ class BookImporter(
     private suspend fun importPdf(file: File, folder: File, title: String): Long {
         val coverTmp = File(folder, "cover-page.jpg")
         val info = PdfImporter.inspect(file, coverTmp)
+        // 解析不出页数说明 PDF 已损坏或不是有效 PDF，不能当成导入成功。
+        if (info.pageCount <= 0) {
+            throw IOException("PDF 无法解析（可能已损坏或加密），已取消导入")
+        }
         val cover = toCoverPng(folder, coverTmp)
         val now = System.currentTimeMillis()
         return library.insertBook(

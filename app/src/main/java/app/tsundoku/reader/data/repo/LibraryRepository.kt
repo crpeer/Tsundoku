@@ -7,6 +7,7 @@ import app.tsundoku.reader.data.local.ChapterEntity
 import app.tsundoku.reader.data.local.toModel
 import app.tsundoku.reader.domain.model.Book
 import app.tsundoku.reader.domain.model.Chapter
+import app.tsundoku.reader.domain.model.ChapterItem
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 
@@ -14,6 +15,8 @@ import kotlinx.coroutines.flow.map
 class LibraryRepository(
     private val bookDao: BookDao,
     private val chapterDao: ChapterDao,
+    /** 事务执行器：由 AppContainer 注入 Room 的 withTransaction。 */
+    private val transaction: suspend (suspend () -> Unit) -> Unit = { block -> block() },
 ) {
 
     fun libraryBooks(): Flow<List<Book>> =
@@ -54,10 +57,39 @@ class LibraryRepository(
         })
     }
 
+    /**
+     * 用远端最新目录更新本地章节，**尽量保住**已缓存正文 / 已读状态 / 阅读进度。
+     *
+     * 整个过程在事务里完成：先读出旧章节到内存，再用合并结果覆盖。
+     * 不会简单地把旧章节全部丢掉重来（那会丢正文缓存和已读状态）。
+     */
+    suspend fun syncChapters(bookId: Long, remote: List<ChapterItem>): ChapterMerge.Result? {
+        if (remote.isEmpty()) return null
+        val book = bookDao.getBook(bookId) ?: return null
+        val local = chapterDao.getChapters(bookId)
+        val merged = ChapterMerge.merge(bookId, local, remote, book.lastChapterIndex)
+
+        transaction {
+            chapterDao.deleteForBook(bookId)
+            chapterDao.insertAll(merged.chapters)
+            bookDao.updateProgress(
+                id = bookId,
+                at = book.lastReadAt ?: System.currentTimeMillis(),
+                index = merged.progressIndex,
+                offset = book.lastPositionOffset,
+            )
+        }
+        return merged
+    }
+
     suspend fun dropChaptersFrom(bookId: Long, fromIndex: Int) = chapterDao.deleteFrom(bookId, fromIndex)
 
-    suspend fun updateProgress(bookId: Long, chapterIndex: Int) =
-        bookDao.updateProgress(bookId, System.currentTimeMillis(), chapterIndex)
+    suspend fun updateProgress(bookId: Long, chapterIndex: Int, offset: Int = 0) =
+        bookDao.updateProgress(bookId, System.currentTimeMillis(), chapterIndex, offset)
+
+    /** 只更新章节内位置，不动章节索引（滚动/翻页时高频调用）。 */
+    suspend fun updatePosition(bookId: Long, chapterIndex: Int, offset: Int) =
+        bookDao.updateProgress(bookId, System.currentTimeMillis(), chapterIndex, offset)
 
     suspend fun markRead(bookId: Long, chapterIndex: Int, read: Boolean) =
         chapterDao.setRead(bookId, chapterIndex, read)

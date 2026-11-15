@@ -31,6 +31,8 @@ data class ProgressMeta(
     val totalChapters: Int = 0,
     val readChapters: Int = 0,
     val lastReadAt: Long = 0,
+    /** 章节内位置：滚动偏移（CSS px）或翻页页码。 */
+    val positionOffset: Int = 0,
 )
 
 /** 批注占位结构：等阅读器选区功能落地后直接写入。 */
@@ -105,6 +107,7 @@ class BookStorage(private val context: Context) {
                 totalChapters = chapters.size,
                 readChapters = chapters.count { it.read },
                 lastReadAt = book.lastReadAt ?: 0,
+                positionOffset = book.lastPositionOffset,
             ),
             annotations = readAnnotations(book.id),
         )

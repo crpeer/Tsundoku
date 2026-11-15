@@ -11,6 +11,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
@@ -23,6 +25,7 @@ import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -47,6 +50,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import app.tsundoku.reader.data.source.BookSource
+import app.tsundoku.reader.data.source.BrowseCategory
 import app.tsundoku.reader.di.AppContainer
 import app.tsundoku.reader.domain.model.BookSourceInfo
 import app.tsundoku.reader.domain.model.SearchItem
@@ -74,6 +78,7 @@ class SourceBrowseViewModel(
         val endReached: Boolean = false,
         val folderUrl: String? = null,
         val folderTitle: String? = null,
+        val categories: List<BrowseCategory> = emptyList(),
     )
 
     private val _state = MutableStateFlow(State())
@@ -87,7 +92,12 @@ class SourceBrowseViewModel(
         viewModelScope.launch {
             val info = runCatching { container.sources.sourceById(sourceId) }.getOrNull()
             source = info
-            _state.update { it.copy(source = info?.info) }
+            _state.update {
+                it.copy(
+                    source = info?.info,
+                    categories = info?.categories().orEmpty(),
+                )
+            }
             reload()
         }
     }
@@ -157,6 +167,14 @@ class SourceBrowseViewModel(
 
     fun openFolder(item: SearchItem) {
         _state.update { it.copy(folderUrl = item.url, folderTitle = item.title, isSearch = false) }
+        reload()
+    }
+
+    /** 点分类入口：用分类地址重新加载（这就是之前被忽略的参数）。 */
+    fun openCategory(category: BrowseCategory) {
+        _state.update {
+            it.copy(folderUrl = category.url, folderTitle = category.name, isSearch = false)
+        }
         reload()
     }
 
@@ -241,6 +259,20 @@ fun SourceBrowseScreen(
                         },
                         modifier = Modifier.padding(horizontal = 12.dp),
                     ) { Text("搜索") }
+                }
+                if (state.categories.isNotEmpty() && !state.isSearch) {
+                    LazyRow(
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        items(state.categories, key = { it.name + it.url }) { category ->
+                            FilterChip(
+                                selected = state.folderTitle == category.name,
+                                onClick = { viewModel.openCategory(category) },
+                                label = { Text(category.name) },
+                            )
+                        }
+                    }
                 }
             }
         },

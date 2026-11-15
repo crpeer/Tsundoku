@@ -1,5 +1,6 @@
 package app.tsundoku.reader.domain.model
 
+import app.tsundoku.reader.data.source.BrowseCategory
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
@@ -20,10 +21,21 @@ data class WebSourceConfig(
     val headers: Map<String, String> = emptyMap(),
     val search: PageRule? = null,
     val browse: PageRule? = null,
+    /** 分类入口列表；为空时退化为「全部 = browse.url」。 */
+    val categories: List<CategoryRule> = emptyList(),
     val details: DetailRule = DetailRule(),
     val chapters: ChapterRule = ChapterRule(),
     val content: ContentRule = ContentRule(),
 )
+
+@Serializable
+data class CategoryRule(
+    val name: String,
+    /** 第一页地址，可含 {{page}} 占位符；相对路径会拼到 base_url。 */
+    val url: String,
+) {
+    fun toCategory(): BrowseCategory = BrowseCategory(name, url)
+}
 
 @Serializable
 data class PageRule(
@@ -60,6 +72,13 @@ data class ChapterRule(
 data class ContentRule(
     val selector: String = "",
     val remove: List<String> = listOf("script", "style", "iframe", ".ads", ".ad"),
+    /**
+     * 「下一页」链接的取值规则，格式同其它规则（例如 `a.next@href`）。
+     * 留空表示该来源不分页。
+     */
+    @SerialName("next_page") val nextPage: String = "",
+    /** 单章最多合并多少页，防止死循环站点把一章拖成几百页。 */
+    @SerialName("max_pages") val maxPages: Int = 8,
 )
 
 /** OPDS 目录源。 */

@@ -153,6 +153,28 @@ files/meta/<id>.json             或写到上面目录里的 meta.json（设置�
 - 该 EPUB 的 `dc:title` 就是 `149228 utf-8`（文件名叫 `149228+utf-8`），所以书名"正确"但难看；
   章节标题也只能取到 `1`（toc.ncx 的 label），后续可从 `chapterN.xhtml` 的 `<title>` 兜底。
 
+## 第五批：审查问题修复（2026-11-15）
+
+按「先核对、再写测试复现、最后改」的顺序处理了审查里的 P0 与阅读器/书源问题，
+逐条对照见 **`docs/review-fixes.md`**（含每项的文件、原因、验证方式与未做项）。
+
+要点：
+
+- `RuleParser`：文本不再被当成 URL（原来 `anonymous` 会变 `https://site/anonymous`）；
+  `select()` 也支持 `||`；支持 `div.a@a@href` 链式
+- `EpubImporter`：`Path` 规范化判越界（原来字符串前缀判断可被同前缀兄弟目录绕过）、
+  条目/体积上限、失败清理
+- 数据库：去掉 `fallbackToDestructiveMigration`，加 `MIGRATION_1_2`（`books.lastPositionOffset`）
+  与升级前自动备份；模拟器实测 v1→v2 数据无损，备份文件生成
+- 目录刷新：改为按 URL 合并（保留缓存正文/已读/进度），事务内完成
+- 正文分页：`ContentPaginator` 跟随 `nextContentUrl` 合并整章，带去重/页数上限/同主机限制
+- 阅读进度：记录章节内位置、退出前落盘、**打开章节不再直接算已读**
+- 空章节/失败：`ChapterContent.Failure` + 重试按钮 + 8s 超时兜底
+- 分类浏览：`browse(url, page)` 不再忽略 url；Legado `exploreUrl` 解析成分类 chip
+- 书源诊断：搜索/详情/目录/正文逐段测试，给出状态、耗时、具体错误
+
+单测从 0 增到 47 条（`app/src/test/`）。
+
 ## 主链路实测（2026-11-14，全部通过）
 
 在模拟器上走完并逐屏截图（`docs/screenshot-*.png`）：

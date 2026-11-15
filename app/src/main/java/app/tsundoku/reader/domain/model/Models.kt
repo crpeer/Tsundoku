@@ -60,6 +60,8 @@ data class Book(
     val updatedAt: Long,
     val totalChapters: Int = 0,
     val readChapters: Int = 0,
+    /** 当前章节内的位置：滚动偏移（CSS px）或翻页页码。 */
+    val lastPositionOffset: Int = 0,
 ) {
     val progress: Float
         get() = when {

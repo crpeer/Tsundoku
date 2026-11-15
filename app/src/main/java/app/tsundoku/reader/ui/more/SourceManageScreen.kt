@@ -4,6 +4,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -14,6 +15,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -64,6 +66,7 @@ class SourceManageViewModel(private val container: AppContainer) : ViewModel() {
 fun SourceManageScreen(
     onBack: () -> Unit,
     onAddSource: () -> Unit,
+    onDiagnose: (BookSourceInfo) -> Unit = {},
 ) {
     val viewModel = appViewModel { SourceManageViewModel(it) }
     val sources by viewModel.sources.collectAsStateWithLifecycle()
@@ -115,13 +118,22 @@ fun SourceManageScreen(
                                 checked = source.enabled,
                                 onCheckedChange = { viewModel.setEnabled(source, it) },
                             )
-                            TextButton(onClick = { pendingDelete = source }) {
-                                Icon(
-                                    Icons.Outlined.Delete,
-                                    contentDescription = "删除",
-                                    modifier = Modifier.size(18.dp),
-                                    tint = MaterialTheme.colorScheme.error,
-                                )
+                            Row {
+                                TextButton(onClick = { onDiagnose(source) }) {
+                                    Icon(
+                                        Icons.Outlined.PlayArrow,
+                                        contentDescription = "诊断",
+                                        modifier = Modifier.size(18.dp),
+                                    )
+                                }
+                                TextButton(onClick = { pendingDelete = source }) {
+                                    Icon(
+                                        Icons.Outlined.Delete,
+                                        contentDescription = "删除",
+                                        modifier = Modifier.size(18.dp),
+                                        tint = MaterialTheme.colorScheme.error,
+                                    )
+                                }
                             }
                         }
                     },

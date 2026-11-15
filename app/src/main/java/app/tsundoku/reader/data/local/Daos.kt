@@ -52,8 +52,8 @@ interface BookDao {
     @Update
     suspend fun update(book: BookEntity)
 
-    @Query("UPDATE books SET lastReadAt = :at, lastChapterIndex = :index WHERE id = :id")
-    suspend fun updateProgress(id: Long, at: Long, index: Int)
+    @Query("UPDATE books SET lastReadAt = :at, lastChapterIndex = :index, lastPositionOffset = :offset WHERE id = :id")
+    suspend fun updateProgress(id: Long, at: Long, index: Int, offset: Int)
 
     @Query("UPDATE books SET inLibrary = :inLibrary WHERE id = :id")
     suspend fun setInLibrary(id: Long, inLibrary: Boolean)

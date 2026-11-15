@@ -33,6 +33,7 @@ import app.tsundoku.reader.ui.library.LibraryScreen
 import app.tsundoku.reader.ui.more.AddSourceScreen
 import app.tsundoku.reader.ui.more.ImportLegadoScreen
 import app.tsundoku.reader.ui.more.MoreScreen
+import app.tsundoku.reader.ui.more.SourceDiagnoseScreen
 import app.tsundoku.reader.ui.more.SourceManageScreen
 import app.tsundoku.reader.ui.reader.ReaderScreen
 import app.tsundoku.reader.ui.search.GlobalSearchScreen
@@ -48,6 +49,7 @@ object Routes {
     const val SOURCE = "source/{sourceId}"
     const val GLOBAL_SEARCH = "global_search?q={q}"
     const val SOURCE_MANAGE = "source_manage"
+    const val SOURCE_DIAGNOSE = "source_diagnose/{sourceId}?name={name}"
     const val ADD_SOURCE = "add_source"
     const val IMPORT_LEGADO = "import_legado"
     const val REMOTE = "remote?sourceId={sourceId}&url={url}&title={title}&cover={cover}&author={author}"
@@ -57,6 +59,9 @@ object Routes {
     fun source(id: Long) = "source/$id"
 
     fun globalSearch(keyword: String) = "global_search?q=${Uri.encode(keyword)}"
+
+    fun diagnose(sourceId: Long, name: String) =
+        "source_diagnose/$sourceId?name=${Uri.encode(name)}"
 
     fun remote(sourceId: Long, url: String, title: String, cover: String?, author: String?) =
         "remote?sourceId=$sourceId" +
@@ -261,6 +266,23 @@ fun AppRoot(container: AppContainer, initialSearchQuery: String? = null) {
                 SourceManageScreen(
                     onBack = { navController.popBackStack() },
                     onAddSource = { navController.navigate(Routes.ADD_SOURCE) },
+                    onDiagnose = { source ->
+                        navController.navigate(Routes.diagnose(source.id, source.name))
+                    },
+                )
+            }
+
+            composable(
+                route = Routes.SOURCE_DIAGNOSE,
+                arguments = listOf(
+                    navArgument("sourceId") { type = NavType.LongType },
+                    navArgument("name") { type = NavType.StringType; defaultValue = "" },
+                ),
+            ) { entry ->
+                SourceDiagnoseScreen(
+                    sourceId = entry.arguments?.getLong("sourceId") ?: -1L,
+                    sourceName = entry.arguments?.getString("name").orEmpty().ifBlank { "书源" },
+                    onBack = { navController.popBackStack() },
                 )
             }
 

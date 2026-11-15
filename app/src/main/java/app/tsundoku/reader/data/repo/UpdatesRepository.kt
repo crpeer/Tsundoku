@@ -44,35 +44,20 @@ class UpdatesRepository(
             return UpdateResult(book.id, book.title, 0, -1, null, "目录为空")
         }
 
-        val local = library.chaptersOnce(book.id)
-        val lastLocalUrl = local.lastOrNull()?.url
-        val matched = if (lastLocalUrl == null) -1 else remote.indexOfLast { it.url == lastLocalUrl }
-        val fresh = if (matched >= 0) {
-            remote.drop(matched + 1)
+        // 合并（而不是追加）才能真正处理「远端插入/改名/删除」，且保住已缓存正文与已读状态。
+        val merged = library.syncChapters(book.id, remote)
+            ?: return UpdateResult(book.id, book.title, 0, -1, null, "书籍不存在")
+        val firstNew = if (merged.added > 0) {
+            merged.chapters.indexOfFirst { it.content.isNullOrBlank() && !it.read }.coerceAtLeast(0)
         } else {
-            val known = local.map { it.url }.toSet()
-            remote.filter { it.url !in known }
+            -1
         }
-        if (fresh.isEmpty()) {
-            return UpdateResult(book.id, book.title, 0, -1, remote.lastOrNull()?.title)
-        }
-
-        val start = local.size
-        val now = System.currentTimeMillis()
-        library.saveChapters(
-            book.id,
-            fresh.mapIndexed { offset, item ->
-                ChapterEntity(
-                    bookId = book.id,
-                    idx = start + offset,
-                    title = item.title,
-                    url = item.url,
-                    content = null,
-                    read = false,
-                    updatedAt = now,
-                )
-            },
+        return UpdateResult(
+            bookId = book.id,
+            title = book.title,
+            newChapters = merged.added,
+            firstNewIndex = firstNew,
+            latestChapter = remote.lastOrNull()?.title,
         )
-        return UpdateResult(book.id, book.title, fresh.size, start, fresh.lastOrNull()?.title)
     }
 }

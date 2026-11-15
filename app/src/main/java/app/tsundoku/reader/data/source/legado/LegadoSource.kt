@@ -2,11 +2,14 @@ package app.tsundoku.reader.data.source.legado
 
 import app.tsundoku.reader.data.net.NetworkClient
 import app.tsundoku.reader.data.source.BookSource
+import app.tsundoku.reader.data.source.BrowseCategory
 import app.tsundoku.reader.data.source.SourceException
+import app.tsundoku.reader.data.source.web.ContentPaginator
 import app.tsundoku.reader.data.source.web.RuleParser
 import app.tsundoku.reader.domain.model.BookDetails
 import app.tsundoku.reader.domain.model.BookSourceInfo
 import app.tsundoku.reader.domain.model.ChapterItem
+import app.tsundoku.reader.domain.model.LegadoContentRule
 import app.tsundoku.reader.domain.model.LegadoSourceConfig
 import app.tsundoku.reader.domain.model.SearchItem
 import app.tsundoku.reader.domain.model.SourceConfigs
@@ -57,7 +60,58 @@ class LegadoSource(
         return items
     }
 
-    override suspend fun browse(url: String?, page: Int): List<SearchItem> = emptyList()
+    override suspend fun browse(url: String?, page: Int): List<SearchItem> {
+        val target = url?.takeIf { it.isNotBlank() } ?: return emptyList()
+        if (page > 1 && !target.contains("{{page}}") && !target.contains("{{page-1}}")) {
+            return emptyList()
+        }
+        val fetchUrl = RuleParser.resolveUrl(fillPage(target, page), "$origin/")
+        val html = network.get(fetchUrl, headers)
+        val doc = RuleParser.parse(html, fetchUrl)
+        val base = doc.baseUri().ifBlank { fetchUrl }
+
+        // 优先用 explore 规则；没有就用 search 规则凑合（很多源两者结构一致）。
+        val explore = config.explore
+        val listRule = explore.bookList.ifBlank { config.search.bookList }
+        if (listRule.isBlank()) throw SourceException("该书源未提供分类列表规则")
+        val items = LegadoRule.elements(doc, listRule).mapNotNull { element ->
+            val title = textOfOr(element, explore.name.ifBlank { config.search.name }, base)
+            val link = LegadoRule.value(element, explore.bookUrl.ifBlank { config.search.bookUrl }, base)
+                ?.trim().orEmpty()
+            if (title.isEmpty() || link.isEmpty()) return@mapNotNull null
+            SearchItem(
+                title = title,
+                url = RuleParser.resolveUrl(fill(link), base),
+                cover = LegadoRule.value(
+                    element,
+                    explore.coverUrl.ifBlank { config.search.coverUrl },
+                    base,
+                ),
+                author = LegadoRule.value(
+                    element,
+                    explore.author.ifBlank { config.search.author },
+                    base,
+                ),
+                description = LegadoRule.value(
+                    element,
+                    explore.intro.ifBlank { config.search.intro },
+                    base,
+                ),
+            )
+        }.distinctBy { it.url }
+        if (items.isEmpty()) throw SourceException("没有解析到分类结果（规则可能不支持）")
+        return items
+    }
+
+    override fun categories(): List<BrowseCategory> = LegadoExplore.parse(config.exploreUrl)
+
+    private fun textOfOr(element: Element, rule: String, base: String): String =
+        if (rule.isBlank()) element.text().trim() else LegadoRule.value(element, rule, base).orEmpty().trim()
+
+    private fun fillPage(raw: String, page: Int): String = pagePattern.replace(raw) { match ->
+        val offset = match.groupValues[1].replace(" ", "").toIntOrNull() ?: 0
+        (page + offset).toString()
+    }
 
     override suspend fun details(url: String): BookDetails {
         val html = network.get(url, headers)
@@ -100,19 +154,42 @@ class LegadoSource(
     }
 
     override suspend fun content(chapterUrl: String): String {
-        val html = network.get(chapterUrl, headers)
-        val doc = RuleParser.parse(html, chapterUrl)
-        val container = LegadoRule.node(doc, config.content.content) ?: doc.body()
+        val rule = config.content
+        val result = ContentPaginator.collect(
+            firstUrl = chapterUrl,
+            maxPages = ContentPaginator.DEFAULT_MAX_PAGES,
+            fetch = { url -> network.get(url, headers) },
+            parse = { html, url -> parseContentPage(html, url, rule) },
+        )
+        if (result.html.isBlank()) {
+            throw SourceException(result.errors.firstOrNull() ?: "正文为空")
+        }
+        return result.html
+    }
+
+    private fun parseContentPage(
+        html: String,
+        pageUrl: String,
+        rule: LegadoContentRule,
+    ): ContentPaginator.ParsedPage {
+        val doc = RuleParser.parse(html, pageUrl)
+        val container = LegadoRule.node(doc, rule.content) ?: doc.body()
         container.select("script,style,iframe,noscript").remove()
         container.select("img").forEach { image ->
             val raw = image.attr("data-src").ifBlank { image.attr("src") }
-            if (raw.isNotBlank()) image.attr("src", RuleParser.resolveUrl(raw, chapterUrl))
+            if (raw.isNotBlank()) image.attr("src", RuleParser.resolveUrl(raw, pageUrl))
         }
         container.select("a").forEach { anchor ->
             val href = anchor.attr("href")
-            if (href.isNotBlank()) anchor.attr("href", RuleParser.resolveUrl(href, chapterUrl))
+            if (href.isNotBlank()) anchor.attr("href", RuleParser.resolveUrl(href, pageUrl))
         }
-        return container.html()
+        val next = if (rule.nextContentUrl.isBlank()) {
+            null
+        } else {
+            LegadoRule.value(doc, rule.nextContentUrl, pageUrl)
+                ?.let { RuleParser.resolveUrl(it, pageUrl) }
+        }
+        return ContentPaginator.ParsedPage(container.html(), next)
     }
 
     private fun textOf(element: Element, rule: String, base: String): String =

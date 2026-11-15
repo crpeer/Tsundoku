@@ -31,6 +31,9 @@ class SourceManager(
     suspend fun enabledSources(): List<BookSourceInfo> =
         sourceDao.getEnabled().map { it.toModel() }
 
+    suspend fun sourcesOnce(): List<BookSourceInfo> =
+        sourceDao.getAll().map { it.toModel() }
+
     suspend fun add(info: BookSourceInfo): Long = sourceDao.insert(info.toEntity())
 
     suspend fun update(info: BookSourceInfo) = sourceDao.update(info.toEntity())

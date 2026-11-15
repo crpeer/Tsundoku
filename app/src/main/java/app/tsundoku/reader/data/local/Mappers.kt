@@ -23,6 +23,7 @@ fun BookEntity.toModel(chapterCount: Int = 0, readCount: Int = 0): Book = Book(
     updatedAt = updatedAt,
     totalChapters = chapterCount,
     readChapters = readCount,
+    lastPositionOffset = lastPositionOffset,
 )
 
 fun BookWithStats.toModel(): Book = book.toModel(chapterCount, readCount)
