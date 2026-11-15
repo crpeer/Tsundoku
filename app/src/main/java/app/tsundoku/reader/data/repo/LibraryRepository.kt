@@ -4,6 +4,7 @@ import app.tsundoku.reader.data.local.BookDao
 import app.tsundoku.reader.data.local.BookEntity
 import app.tsundoku.reader.data.local.ChapterDao
 import app.tsundoku.reader.data.local.ChapterEntity
+import app.tsundoku.reader.data.local.ChapterSearchRow
 import app.tsundoku.reader.data.local.toModel
 import app.tsundoku.reader.domain.model.Book
 import app.tsundoku.reader.domain.model.Chapter
@@ -26,6 +27,10 @@ class LibraryRepository(
 
     fun book(id: Long): Flow<Book?> =
         bookDao.observeBook(id).map { it?.toModel() }
+
+    /** 全书搜索：在已缓存的章节正文里查文字。 */
+    suspend fun searchChapters(bookId: Long, query: String): List<ChapterSearchRow> =
+        chapterDao.search(bookId, query)
 
     fun chapters(bookId: Long): Flow<List<Chapter>> =
         chapterDao.observeChapters(bookId).map { list -> list.map { it.toModel() } }

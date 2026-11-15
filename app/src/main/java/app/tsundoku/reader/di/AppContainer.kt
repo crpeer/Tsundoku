@@ -10,6 +10,7 @@ import app.tsundoku.reader.data.local.DatabaseBackups
 import app.tsundoku.reader.data.local.DatabaseMigrations
 import app.tsundoku.reader.data.net.NetworkClient
 import app.tsundoku.reader.data.prefs.SettingsRepository
+import app.tsundoku.reader.data.repo.AnnotationRepository
 import app.tsundoku.reader.data.repo.LibraryRepository
 import app.tsundoku.reader.data.repo.UpdatesRepository
 import app.tsundoku.reader.data.source.SourceManager
@@ -72,7 +73,8 @@ class AppContainer(private val app: Application) {
     val sources = SourceManager(database.sourceDao(), network)
     val settings = SettingsRepository(app)
     val storage = BookStorage(app)
-    val meta = MetadataSyncer(storage, library, settings)
+    val annotations = AnnotationRepository(database.annotationDao(), database.bookmarkDao())
+    val meta = MetadataSyncer(storage, library, settings, annotations)
     val importer = BookImporter(app, library, network, storage, meta)
     val legadoImporter = LegadoImporter(database.sourceDao())
     val updates = UpdatesRepository(library, sources)

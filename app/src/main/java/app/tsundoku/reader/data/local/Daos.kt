@@ -113,6 +113,68 @@ interface ChapterDao {
 
     @Query("DELETE FROM chapters WHERE bookId = :bookId")
     suspend fun deleteForBook(bookId: Long)
+
+    /** 全书搜索：只比已缓存的正文，返回命中的章节（摘要由调用方截取）。 */
+    @Query(
+        """
+        SELECT idx, title, content FROM chapters
+        WHERE bookId = :bookId AND content IS NOT NULL AND content LIKE '%' || :query || '%'
+        ORDER BY idx ASC
+        """,
+    )
+    suspend fun search(bookId: Long, query: String): List<ChapterSearchRow>
+}
+
+@Dao
+interface AnnotationDao {
+
+    @Query(
+        "SELECT * FROM annotations WHERE bookId = :bookId ORDER BY chapterIndex ASC, startOffset ASC",
+    )
+    fun observeForBook(bookId: Long): Flow<List<AnnotationEntity>>
+
+    @Query("SELECT * FROM annotations WHERE bookId = :bookId AND chapterIndex = :chapter")
+    suspend fun forChapter(bookId: Long, chapter: Int): List<AnnotationEntity>
+
+    @Query("SELECT * FROM annotations WHERE bookId = :bookId ORDER BY chapterIndex ASC, startOffset ASC")
+    suspend fun getForBook(bookId: Long): List<AnnotationEntity>
+
+    @Query("SELECT COUNT(*) FROM annotations WHERE bookId = :bookId")
+    fun observeCount(bookId: Long): Flow<Int>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(entity: AnnotationEntity)
+
+    @Query("UPDATE annotations SET note = :note, color = :color, updatedAt = :at WHERE id = :id")
+    suspend fun updateNote(id: String, note: String?, color: Int, at: Long)
+
+    @Query("DELETE FROM annotations WHERE id = :id")
+    suspend fun delete(id: String)
+
+    @Query("DELETE FROM annotations WHERE bookId = :bookId")
+    suspend fun deleteForBook(bookId: Long)
+}
+
+@Dao
+interface BookmarkDao {
+
+    @Query("SELECT * FROM bookmarks WHERE bookId = :bookId ORDER BY chapterIndex ASC, offset ASC")
+    fun observeForBook(bookId: Long): Flow<List<BookmarkEntity>>
+
+    @Query("SELECT COUNT(*) FROM bookmarks WHERE bookId = :bookId")
+    fun observeCount(bookId: Long): Flow<Int>
+
+    @Query("SELECT * FROM bookmarks WHERE bookId = :bookId ORDER BY chapterIndex ASC, offset ASC")
+    suspend fun getForBook(bookId: Long): List<BookmarkEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(entity: BookmarkEntity)
+
+    @Query("DELETE FROM bookmarks WHERE id = :id")
+    suspend fun delete(id: String)
+
+    @Query("DELETE FROM bookmarks WHERE bookId = :bookId")
+    suspend fun deleteForBook(bookId: Long)
 }
 
 @Dao

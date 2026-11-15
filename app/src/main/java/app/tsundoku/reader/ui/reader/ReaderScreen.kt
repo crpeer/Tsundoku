@@ -10,9 +10,16 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.wrapContentSize
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.AnnotatedString
+import app.tsundoku.reader.data.repo.HIGHLIGHT_COLORS
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -35,8 +42,17 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.List
+import androidx.compose.material.icons.outlined.BookmarkAdd
+import androidx.compose.material.icons.outlined.ContentCopy
+import androidx.compose.material.icons.outlined.EditNote
+import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.StickyNote2
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
@@ -49,6 +65,7 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -61,12 +78,15 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -74,9 +94,13 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
+import app.tsundoku.reader.data.local.AnnotationEntity
+import app.tsundoku.reader.data.local.BookmarkEntity
 import app.tsundoku.reader.data.prefs.ReaderFontFamily
 import app.tsundoku.reader.data.prefs.ReaderFontWeight
 import app.tsundoku.reader.data.prefs.ReaderLayout
+import app.tsundoku.reader.data.prefs.ReaderPageAnim
+import app.tsundoku.reader.data.prefs.ReaderTapZone
 import app.tsundoku.reader.data.prefs.ReaderSettings
 import app.tsundoku.reader.data.prefs.ReaderTheme
 import app.tsundoku.reader.data.prefs.ReaderWritingMode
@@ -97,6 +121,11 @@ import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.float
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -104,6 +133,37 @@ import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.util.Locale
 import kotlin.math.roundToInt
+
+/** 当前选中的文字（坐标已换算成物理像素，供 Compose 定位浮动工具条）。 */
+data class SelectionInfo(
+    val text: String,
+    val startPath: String,
+    val startOffset: Int,
+    val endPath: String,
+    val endOffset: Int,
+    val xPx: Float,
+    val yPx: Float,
+    val heightPx: Float,
+)
+
+/** 批注/书签列表里的一行。 */
+data class AnnoItem(
+    val id: String,
+    val text: String,
+    val note: String?,
+    val color: Int,
+    val chapterIndex: Int,
+    val chapterTitle: String,
+    val ratio: Float = 0f,
+)
+
+/** 全书搜索命中的一段文字。 */
+data class SearchHit(
+    val chapterIndex: Int,
+    val chapterTitle: String,
+    val snippet: String,
+    val query: String,
+)
 
 sealed interface ChapterContent {
     data object Loading : ChapterContent
@@ -139,9 +199,47 @@ class ReaderViewModel(
     private val _initialOffset = MutableStateFlow(0)
     val initialOffset: StateFlow<Int> = _initialOffset.asStateFlow()
 
+    /** >= 0 时按相对位置打开（回溯到上一章时用它落在章末）。 */
+    private val _initialRatio = MutableStateFlow(-1f)
+    val initialRatio: StateFlow<Float> = _initialRatio.asStateFlow()
+
+    /** 本书当前章节的批注（JSON，交给脚本渲染高亮）。 */
+    private val _annotationsJson = MutableStateFlow("[]")
+    val annotationsJson: StateFlow<String> = _annotationsJson.asStateFlow()
+
+    private val _annotations = MutableStateFlow<List<AnnoItem>>(emptyList())
+    val annotations: StateFlow<List<AnnoItem>> = _annotations.asStateFlow()
+
+    private val _bookmarks = MutableStateFlow<List<AnnoItem>>(emptyList())
+    val bookmarks: StateFlow<List<AnnoItem>> = _bookmarks.asStateFlow()
+
+    private val _selection = MutableStateFlow<SelectionInfo?>(null)
+    val selection: StateFlow<SelectionInfo?> = _selection.asStateFlow()
+
+    /** 点中已有高亮时要展示的批注 id。 */
+    private val _highlightTap = MutableStateFlow<String?>(null)
+    val highlightTap: StateFlow<String?> = _highlightTap.asStateFlow()
+
+    /** 搜索结果跳转后要在正文里定位的文字。 */
+    private val _pendingFind = MutableStateFlow<String?>(null)
+    val pendingFind: StateFlow<String?> = _pendingFind.asStateFlow()
+
+    private val _searchResults = MutableStateFlow<List<SearchHit>>(emptyList())
+    val searchResults: StateFlow<List<SearchHit>> = _searchResults.asStateFlow()
+
+    private val _pageInfo = MutableStateFlow(0 to 1)
+    val pageInfo: StateFlow<Pair<Int, Int>> = _pageInfo.asStateFlow()
+
+    private var currentSelection: SelectionInfo? = null
+    private var allAnnotations: List<AnnotationEntity> = emptyList()
+    private var allBookmarks: List<BookmarkEntity> = emptyList()
+
     private var loadJob: Job? = null
     private var saveJob: Job? = null
     private var currentOffset = 0
+
+    /** 下一次加载章节时要用的相对位置，消费一次就清空。 */
+    private var pendingRatio = -1f
 
     init {
         viewModelScope.launch {
@@ -185,7 +283,10 @@ class ReaderViewModel(
         goTo(_index.value + 1)
     }
 
+    /** 上一章：从章末开始，和纸质书往前翻的手感一致。 */
     fun previous() {
+        if (_index.value <= 0) return
+        pendingRatio = 1f
         goTo(_index.value - 1)
     }
 
@@ -286,6 +387,225 @@ class ReaderViewModel(
         viewModelScope.launch { container.settings.setHorizontalPadding(value) }
     }
 
+    fun setPageAnim(anim: ReaderPageAnim) {
+        viewModelScope.launch { container.settings.setPageAnim(anim) }
+    }
+
+    fun setTapZone(zone: ReaderTapZone) {
+        viewModelScope.launch { container.settings.setTapZone(zone) }
+    }
+
+    fun setVolumeKeys(value: Boolean) {
+        viewModelScope.launch { container.settings.setVolumeKeys(value) }
+    }
+
+    fun setLetterSpacing(value: Float) {
+        viewModelScope.launch { container.settings.setLetterSpacing(value) }
+    }
+
+    fun setWordSpacing(value: Float) {
+        viewModelScope.launch { container.settings.setWordSpacing(value) }
+    }
+
+    fun setJustify(value: Boolean) {
+        viewModelScope.launch { container.settings.setJustify(value) }
+    }
+
+    // ---------- 批注 / 书签 / 搜索 ----------
+
+    fun onPageChanged(page: Int, pages: Int) {
+        _pageInfo.value = page to pages
+    }
+
+    fun onSelectionJson(json: String) {
+        val info = parseSelection(json) ?: return
+        currentSelection = info
+        _selection.value = info
+    }
+
+    fun onSelectionCleared() {
+        currentSelection = null
+        _selection.value = null
+    }
+
+    fun onHighlightTapped(id: String) {
+        if (allAnnotations.any { it.id == id }) _highlightTap.value = id
+    }
+
+    fun dismissHighlightTap() {
+        _highlightTap.value = null
+    }
+
+    fun addHighlight(color: Int, note: String? = null) {
+        val sel = currentSelection ?: return
+        val current = book.value ?: return
+        val chapterIndex = _index.value
+        val chapterTitle = chapters.value.getOrNull(chapterIndex)?.title ?: ""
+        currentSelection = null
+        _selection.value = null
+        viewModelScope.launch {
+            container.annotations.addAnnotation(
+                bookId = current.id,
+                chapterIndex = chapterIndex,
+                chapterTitle = chapterTitle,
+                startPath = sel.startPath,
+                startOffset = sel.startOffset,
+                endPath = sel.endPath,
+                endOffset = sel.endOffset,
+                text = sel.text,
+                color = color,
+                note = note,
+            )
+            refreshAnnotations()
+            container.meta.sync(current.id)
+        }
+    }
+
+    fun updateAnnotation(id: String, note: String?, color: Int) {
+        val current = book.value ?: return
+        viewModelScope.launch {
+            container.annotations.updateAnnotation(id, note, color)
+            _highlightTap.value = null
+            refreshAnnotations()
+            container.meta.sync(current.id)
+        }
+    }
+
+    fun deleteAnnotation(id: String) {
+        val current = book.value ?: return
+        viewModelScope.launch {
+            container.annotations.deleteAnnotation(id)
+            _highlightTap.value = null
+            refreshAnnotations()
+            container.meta.sync(current.id)
+        }
+    }
+
+    fun addBookmark(note: String? = null) {
+        val current = book.value ?: return
+        val chapterIndex = _index.value
+        val chapterTitle = chapters.value.getOrNull(chapterIndex)?.title ?: ""
+        viewModelScope.launch {
+            container.annotations.addBookmark(
+                bookId = current.id,
+                chapterIndex = chapterIndex,
+                chapterTitle = chapterTitle,
+                offset = currentOffset,
+                ratio = if (_pageInfo.value.second > 1) {
+                    _pageInfo.value.first.toFloat() / (_pageInfo.value.second - 1)
+                } else {
+                    0f
+                },
+                excerpt = null,
+                note = note,
+            )
+            refreshAnnotations()
+            container.meta.sync(current.id)
+            _message.value = "已添加书签"
+        }
+    }
+
+    fun deleteBookmark(id: String) {
+        val current = book.value ?: return
+        viewModelScope.launch {
+            container.annotations.deleteBookmark(id)
+            refreshAnnotations()
+            container.meta.sync(current.id)
+        }
+    }
+
+    fun search(query: String) {
+        val current = book.value ?: return
+        val q = query.trim()
+        if (q.isEmpty()) {
+            _searchResults.value = emptyList()
+            return
+        }
+        viewModelScope.launch {
+            val rows = container.library.searchChapters(current.id, q)
+            _searchResults.value = rows.mapNotNull { row ->
+                val content = row.content ?: return@mapNotNull null
+                val at = content.indexOf(q)
+                if (at < 0) return@mapNotNull null
+                val start = (at - 30).coerceAtLeast(0)
+                val end = (at + q.length + 60).coerceAtMost(content.length)
+                SearchHit(
+                    chapterIndex = row.idx,
+                    chapterTitle = row.title,
+                    snippet = content.substring(start, end).replace('\n', ' '),
+                    query = q,
+                )
+            }
+        }
+    }
+
+    fun openSearchHit(hit: SearchHit) {
+        _pendingFind.value = hit.query
+        goTo(hit.chapterIndex)
+    }
+
+    fun consumePendingFind() {
+        _pendingFind.value = null
+    }
+
+    private fun refreshAnnotations() {
+        val current = book.value ?: return
+        viewModelScope.launch {
+            allAnnotations = container.annotations.annotations(current.id)
+            allBookmarks = container.annotations.bookmarks(current.id)
+            _annotations.value = allAnnotations.map {
+                AnnoItem(it.id, it.text, it.note, it.color, it.chapterIndex, it.chapterTitle)
+            }
+            _bookmarks.value = allBookmarks.map {
+                AnnoItem(
+                    id = it.id,
+                    text = it.excerpt ?: "",
+                    note = it.note,
+                    color = -1,
+                    chapterIndex = it.chapterIndex,
+                    chapterTitle = it.chapterTitle,
+                    ratio = it.ratio,
+                )
+            }
+            _annotationsJson.value = annotationsJsonFor(allAnnotations, _index.value)
+        }
+    }
+
+    private fun annotationsJsonFor(list: List<AnnotationEntity>, chapter: Int): String =
+        list.filter { it.chapterIndex == chapter }.joinToString(prefix = "[", postfix = "]") { a ->
+            "{\"id\":${jsonString(a.id)},\"sp\":${jsonString(a.startPath)},\"so\":${a.startOffset}," +
+                "\"ep\":${jsonString(a.endPath)},\"eo\":${a.endOffset},\"color\":${a.color}}"
+        }
+
+    private fun parseSelection(json: String): SelectionInfo? = runCatching {
+        val obj = Json.parseToJsonElement(json).jsonObject
+        SelectionInfo(
+            text = obj["text"]?.jsonPrimitive?.content ?: return null,
+            startPath = obj["sp"]?.jsonPrimitive?.content ?: return null,
+            startOffset = obj["so"]?.jsonPrimitive?.int ?: 0,
+            endPath = obj["ep"]?.jsonPrimitive?.content ?: return null,
+            endOffset = obj["eo"]?.jsonPrimitive?.int ?: 0,
+            xPx = obj["x"]?.jsonPrimitive?.float ?: 0f,
+            yPx = obj["y"]?.jsonPrimitive?.float ?: 0f,
+            heightPx = obj["h"]?.jsonPrimitive?.float ?: 0f,
+        )
+    }.getOrNull()
+
+    private fun jsonString(value: String): String = buildString {
+        append('"')
+        value.forEach { ch ->
+            when (ch) {
+                '\\' -> append("\\\\")
+                '"' -> append("\\\"")
+                '\n' -> append("\\n")
+                '\r' -> append("\\r")
+                '\t' -> append("\\t")
+                else -> if (ch < ' ') append("\\u%04x".format(ch.code)) else append(ch)
+            }
+        }
+        append('"')
+    }
+
     fun setWritingMode(mode: ReaderWritingMode) {
         viewModelScope.launch { container.settings.setWritingMode(mode) }
     }
@@ -313,7 +633,10 @@ class ReaderViewModel(
             // 只有重新进入上次读的那一章才恢复位置；否则从章首开始。
             currentOffset = if (index == current.lastChapterIndex) current.lastPositionOffset else 0
             _initialOffset.value = currentOffset
+            _initialRatio.value = pendingRatio
+            pendingRatio = -1f
             container.library.updateProgress(current.id, index, currentOffset)
+            refreshAnnotations()
 
             val stored = chapter.content
             val localPath = stored?.takeIf { it.isNotBlank() && File(it).exists() }
@@ -365,12 +688,28 @@ fun ReaderScreen(
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val message by viewModel.message.collectAsStateWithLifecycle()
     val initialOffset by viewModel.initialOffset.collectAsStateWithLifecycle()
+    val initialRatio by viewModel.initialRatio.collectAsStateWithLifecycle()
+    val annotationsJson by viewModel.annotationsJson.collectAsStateWithLifecycle()
+    val annotations by viewModel.annotations.collectAsStateWithLifecycle()
+    val bookmarks by viewModel.bookmarks.collectAsStateWithLifecycle()
+    val selection by viewModel.selection.collectAsStateWithLifecycle()
+    val highlightTap by viewModel.highlightTap.collectAsStateWithLifecycle()
+    val pendingFind by viewModel.pendingFind.collectAsStateWithLifecycle()
+    val searchResults by viewModel.searchResults.collectAsStateWithLifecycle()
 
     var showToc by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
     var pdfPage by remember { mutableStateOf(0) }
     var pageInfo by remember { mutableStateOf(0 to 1) }
     val snackbarHostState = remember { SnackbarHostState() }
+    val turnController = remember { ReaderTurnController() }
+    var chromeVisible by remember { mutableStateOf(true) }
+    var showAnnotations by remember { mutableStateOf(false) }
+    var showSearch by remember { mutableStateOf(false) }
+    var noteDraft by remember { mutableStateOf<String?>(null) }
+    var noteEditing by remember { mutableStateOf<AnnoItem?>(null) }
+    var searchQuery by remember { mutableStateOf("") }
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
 
     LaunchedEffect(message) {
         message?.let {
@@ -389,8 +728,32 @@ fun ReaderScreen(
     val themedChrome = !isPdf && current != null
     val scope = rememberCoroutineScope()
 
+    DisposableEffect(settings.volumeKeys, isPdf) {
+        ReaderKeyEvents.handler = if (settings.volumeKeys && !isPdf) {
+            { event ->
+                if (event.action != android.view.KeyEvent.ACTION_DOWN) {
+                    false
+                } else {
+                    when (event.keyCode) {
+                        android.view.KeyEvent.KEYCODE_VOLUME_DOWN -> {
+                            turnController.turn?.invoke(true)
+                            true
+                        }
+                        android.view.KeyEvent.KEYCODE_VOLUME_UP -> {
+                            turnController.turn?.invoke(false)
+                            true
+                        }
+                        else -> false
+                    }
+                }
+            }
+        } else null
+        onDispose { ReaderKeyEvents.handler = null }
+    }
+
     // 退出前把当前位置写库，避免「看完就退」丢进度。
-    BackHandler {
+    // 目录/设置面板打开时要让位给面板自己的返回处理（否则返回键什么都关不掉）。
+    BackHandler(enabled = !showSettings && !showToc) {
         scope.launch {
             viewModel.flushPosition()
             onBack()
@@ -400,6 +763,7 @@ fun ReaderScreen(
     Scaffold(
         containerColor = if (themedChrome) readerBg else MaterialTheme.colorScheme.background,
         topBar = {
+            if (chromeVisible) {
             TopAppBar(
                 colors = if (themedChrome) {
                     TopAppBarDefaults.topAppBarColors(
@@ -425,7 +789,7 @@ fun ReaderScreen(
                             } else {
                                 val base = "${index + 1} / ${chapters.size}"
                                 if (settings.layout == ReaderLayout.PAGED) {
-                                    "$base · 第 ${pageInfo.first + 1} 页"
+                                    "$base · 第 ${pageInfo.first + 1} / ${pageInfo.second} 页"
                                 } else {
                                     base
                                 }
@@ -446,6 +810,15 @@ fun ReaderScreen(
                 },
                 actions = {
                     if (!isPdf && chapters.isNotEmpty()) {
+                        IconButton(onClick = { showSearch = true }) {
+                            Icon(Icons.Outlined.Search, contentDescription = "搜索")
+                        }
+                        IconButton(onClick = { viewModel.addBookmark() }) {
+                            Icon(Icons.Outlined.BookmarkAdd, contentDescription = "添加书签")
+                        }
+                        IconButton(onClick = { showAnnotations = true }) {
+                            Icon(Icons.Outlined.StickyNote2, contentDescription = "批注与书签")
+                        }
                         IconButton(onClick = { showToc = true }) {
                             Icon(Icons.AutoMirrored.Outlined.List, contentDescription = "目录")
                         }
@@ -455,9 +828,10 @@ fun ReaderScreen(
                     }
                 },
             )
+            }
         },
         bottomBar = {
-            if (!isPdf && chapters.isNotEmpty()) {
+            if (chromeVisible && !isPdf && chapters.isNotEmpty()) {
                 Surface(color = readerBg, tonalElevation = 0.dp) {
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
@@ -541,8 +915,23 @@ fun ReaderScreen(
                         readerSettings = settings,
                         theme = readerTheme,
                         initialOffset = initialOffset,
+                        initialRatio = initialRatio,
+                        turnController = turnController,
+                        annotationsJson = annotationsJson,
+                        pendingFind = pendingFind,
+                        onSelectionJson = viewModel::onSelectionJson,
+                        onSelectionCleared = viewModel::onSelectionCleared,
+                        onHighlightTap = viewModel::onHighlightTapped,
+                        onFindConsumed = viewModel::consumePendingFind,
                         onPosition = viewModel::onPosition,
-                        onPageChanged = { page, pages -> pageInfo = page to pages },
+                        onPageChanged = { page, pages ->
+                            pageInfo = page to pages
+                            viewModel.onPageChanged(page, pages)
+                        },
+                        onEdgeTurn = { forward ->
+                            if (forward) viewModel.next() else viewModel.previous()
+                        },
+                        onMenuTap = { chromeVisible = !chromeVisible },
                         modifier = Modifier.fillMaxSize(),
                     )
                 }
@@ -579,6 +968,130 @@ fun ReaderScreen(
                     )
                 }
             }
+        }
+    }
+
+    // 选中文字后的浮动工具条
+    selection?.let { sel ->
+        val density = LocalDensity.current
+        SelectionToolbar(
+            xDp = with(density) { sel.xPx.toDp() },
+            yDp = with(density) { sel.yPx.toDp() },
+            heightDp = with(density) { sel.heightPx.toDp() },
+            onColor = { color -> viewModel.addHighlight(color) },
+            onNote = { noteEditing = null; noteDraft = "" },
+            onCopy = {
+                clipboard.setText(AnnotatedString(sel.text))
+                viewModel.onSelectionCleared()
+            },
+            onSearch = {
+                searchQuery = sel.text.take(40)
+                viewModel.search(searchQuery)
+                showSearch = true
+                viewModel.onSelectionCleared()
+            },
+        )
+    }
+
+    // 点中已有高亮
+    highlightTap?.let { id ->
+        val item = annotations.firstOrNull { it.id == id }
+        if (item != null) {
+            AlertDialog(
+                onDismissRequest = viewModel::dismissHighlightTap,
+                title = { Text(if (item.note.isNullOrBlank()) "高亮" else "笔记") },
+                text = {
+                    Column {
+                        Text(item.text, style = MaterialTheme.typography.bodyMedium)
+                        if (!item.note.isNullOrBlank()) {
+                            Text(
+                                text = item.note,
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.padding(top = 8.dp),
+                            )
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        noteEditing = item
+                        noteDraft = item.note ?: ""
+                        viewModel.dismissHighlightTap()
+                    }) { Text("编辑笔记") }
+                },
+                dismissButton = {
+                    Row {
+                        TextButton(onClick = { viewModel.deleteAnnotation(id) }) { Text("删除") }
+                        TextButton(onClick = viewModel::dismissHighlightTap) { Text("关闭") }
+                    }
+                },
+            )
+        }
+    }
+
+    // 新建/编辑笔记
+    noteDraft?.let { draft ->
+        AlertDialog(
+            onDismissRequest = { noteDraft = null; noteEditing = null },
+            title = { Text(if (noteEditing == null) "添加笔记" else "编辑笔记") },
+            text = {
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = { noteDraft = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 3,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val editing = noteEditing
+                    if (editing != null) {
+                        viewModel.updateAnnotation(editing.id, draft.ifBlank { null }, editing.color)
+                    } else {
+                        viewModel.addHighlight(0, draft.ifBlank { null })
+                    }
+                    noteDraft = null
+                    noteEditing = null
+                }) { Text("保存") }
+            },
+            dismissButton = {
+                TextButton(onClick = { noteDraft = null; noteEditing = null }) { Text("取消") }
+            },
+        )
+    }
+
+    if (showAnnotations) {
+        ModalBottomSheet(onDismissRequest = { showAnnotations = false }) {
+            AnnotationsSheet(
+                annotations = annotations,
+                bookmarks = bookmarks,
+                onJump = { chapter ->
+                    showAnnotations = false
+                    viewModel.goTo(chapter)
+                },
+                onEditNote = { item ->
+                    showAnnotations = false
+                    noteEditing = item
+                    noteDraft = item.note ?: ""
+                },
+                onDeleteAnnotation = viewModel::deleteAnnotation,
+                onDeleteBookmark = viewModel::deleteBookmark,
+            )
+        }
+    }
+
+    if (showSearch) {
+        ModalBottomSheet(onDismissRequest = { showSearch = false }) {
+            SearchSheet(
+                query = searchQuery,
+                onQueryChange = { searchQuery = it },
+                onSearch = { viewModel.search(it) },
+                results = searchResults,
+                onOpen = { hit ->
+                    showSearch = false
+                    viewModel.openSearchHit(hit)
+                },
+            )
         }
     }
 
@@ -661,6 +1174,46 @@ fun ReaderScreen(
                     onSelect = viewModel::setWritingMode,
                 )
                 SettingChips(
+                    title = "翻页动画",
+                    options = ReaderPageAnim.entries,
+                    selected = settings.pageAnim,
+                    label = { it.label },
+                    onSelect = viewModel::setPageAnim,
+                )
+                SettingChips(
+                    title = "点击区域",
+                    options = ReaderTapZone.entries,
+                    selected = settings.tapZone,
+                    label = { it.label },
+                    onSelect = viewModel::setTapZone,
+                )
+                SettingSlider(
+                    title = "字间距",
+                    valueLabel = formatDecimal(settings.letterSpacing) + " em",
+                    value = settings.letterSpacing,
+                    range = 0f..0.3f,
+                    steps = 5,
+                    onChange = viewModel::setLetterSpacing,
+                )
+                SettingSlider(
+                    title = "词间距",
+                    valueLabel = formatDecimal(settings.wordSpacing) + " em",
+                    value = settings.wordSpacing,
+                    range = 0f..0.5f,
+                    steps = 9,
+                    onChange = viewModel::setWordSpacing,
+                )
+                SettingSwitch(
+                    title = "两端对齐",
+                    checked = settings.justify,
+                    onChange = viewModel::setJustify,
+                )
+                SettingSwitch(
+                    title = "音量键翻页",
+                    checked = settings.volumeKeys,
+                    onChange = viewModel::setVolumeKeys,
+                )
+                SettingChips(
                     title = "主题",
                     options = ReaderTheme.entries,
                     selected = settings.theme,
@@ -672,7 +1225,202 @@ fun ReaderScreen(
     }
 }
 
+@Composable
+private fun SelectionToolbar(
+    xDp: androidx.compose.ui.unit.Dp,
+    yDp: androidx.compose.ui.unit.Dp,
+    heightDp: androidx.compose.ui.unit.Dp,
+    onColor: (Int) -> Unit,
+    onNote: () -> Unit,
+    onCopy: () -> Unit,
+    onSearch: () -> Unit,
+) {
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val x = xDp.coerceIn(0.dp, (maxWidth - 300.dp).coerceAtLeast(0.dp))
+        val y = (yDp + heightDp + 8.dp).coerceIn(0.dp, (maxHeight - 60.dp).coerceAtLeast(0.dp))
+        Surface(
+            shape = androidx.compose.foundation.shape.RoundedCornerShape(26.dp),
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 6.dp,
+            shadowElevation = 8.dp,
+            modifier = Modifier
+                .offset(x = x, y = y)
+                .wrapContentSize(),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+            ) {
+                HIGHLIGHT_COLORS.forEachIndexed { index, hex ->
+                    Box(
+                        modifier = Modifier
+                            .padding(horizontal = 4.dp)
+                            .size(24.dp)
+                            .clip(androidx.compose.foundation.shape.CircleShape)
+                            .background(Color(android.graphics.Color.parseColor(hex)))
+                            .clickable { onColor(index) },
+                    )
+                }
+                IconButton(onClick = onNote) {
+                    Icon(Icons.Outlined.EditNote, contentDescription = "笔记")
+                }
+                IconButton(onClick = onCopy) {
+                    Icon(Icons.Outlined.ContentCopy, contentDescription = "复制")
+                }
+                IconButton(onClick = onSearch) {
+                    Icon(Icons.Outlined.Search, contentDescription = "在书中搜索")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AnnotationsSheet(
+    annotations: List<AnnoItem>,
+    bookmarks: List<AnnoItem>,
+    onJump: (Int) -> Unit,
+    onEditNote: (AnnoItem) -> Unit,
+    onDeleteAnnotation: (String) -> Unit,
+    onDeleteBookmark: (String) -> Unit,
+) {
+    var tab by remember { mutableStateOf(0) }
+    Column(modifier = Modifier.fillMaxWidth().fillMaxHeight(0.7f)) {
+        TabRow(selectedTabIndex = tab) {
+            Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("批注 ${annotations.size}") })
+            Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("书签 ${bookmarks.size}") })
+        }
+        val items = if (tab == 0) annotations else bookmarks
+        if (items.isEmpty()) {
+            Text(
+                text = if (tab == 0) "长按选中文字即可添加高亮或笔记" else "点顶栏的书签图标添加书签",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(24.dp),
+            )
+            return@Column
+        }
+        LazyColumn(modifier = Modifier.fillMaxWidth()) {
+            items(items, key = { it.id }) { item ->
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onJump(item.chapterIndex) }
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                ) {
+                    Text(
+                        text = item.chapterTitle.ifBlank { "第 ${item.chapterIndex + 1} 章" },
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        text = item.text,
+                        style = MaterialTheme.typography.bodyMedium,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(top = 2.dp),
+                    )
+                    if (!item.note.isNullOrBlank()) {
+                        Text(
+                            text = item.note,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
+                    }
+                    Row(modifier = Modifier.padding(top = 4.dp)) {
+                        if (tab == 0) {
+                            TextButton(onClick = { onEditNote(item) }) { Text("笔记") }
+                            TextButton(onClick = { onDeleteAnnotation(item.id) }) { Text("删除") }
+                        } else {
+                            TextButton(onClick = { onDeleteBookmark(item.id) }) { Text("删除") }
+                        }
+                    }
+                }
+                androidx.compose.material3.HorizontalDivider()
+            }
+        }
+    }
+}
+
+@Composable
+private fun SearchSheet(
+    query: String,
+    onQueryChange: (String) -> Unit,
+    onSearch: (String) -> Unit,
+    results: List<SearchHit>,
+    onOpen: (SearchHit) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .fillMaxHeight(0.7f)
+            .padding(horizontal = 16.dp),
+    ) {
+        OutlinedTextField(
+            value = query,
+            onValueChange = { onQueryChange(it); onSearch(it) },
+            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+            singleLine = true,
+            placeholder = { Text("在本书中搜索") },
+        )
+        Text(
+            text = if (results.isEmpty()) "输入关键字后自动搜索（只搜已缓存的章节正文）" else "共 ${results.size} 章命中",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(vertical = 8.dp),
+        )
+        LazyColumn(modifier = Modifier.fillMaxWidth()) {
+            items(results, key = { it.chapterIndex }) { hit ->
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onOpen(hit) }
+                        .padding(vertical = 8.dp),
+                ) {
+                    Text(hit.chapterTitle, style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        text = hit.snippet,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                androidx.compose.material3.HorizontalDivider()
+            }
+        }
+    }
+}
+
 private fun formatDecimal(value: Float): String = String.format(Locale.US, "%.2f", value)
+
+@Composable
+private fun SettingSwitch(
+    title: String,
+    checked: Boolean,
+    onChange: (Boolean) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleSmall,
+            modifier = Modifier.weight(1f),
+        )
+        Switch(checked = checked, onCheckedChange = onChange)
+    }
+}
+
+/** 音量键由 Activity 统一派发：WebView 抢到焦点后 Compose 收不到按键。 */
+internal object ReaderKeyEvents {
+    @Volatile
+    var handler: ((android.view.KeyEvent) -> Boolean)? = null
+}
 
 @Composable
 private fun SettingSlider(
@@ -733,7 +1481,7 @@ private fun <T> SettingChips(
     }
 }
 
-private fun cssFor(
+internal fun cssFor(
     theme: ReaderTheme,
     s: ReaderSettings,
     viewWidthPx: Int,
@@ -744,17 +1492,11 @@ private fun cssFor(
     val paged = s.layout == ReaderLayout.PAGED && !vertical
     val blockFlow = when {
         paged -> {
-            // 一列 = 一页：列宽 = 可视宽度 - 2*pad，列间距 = 2*pad，所以翻页步长正好等于可视宽度。
+            // 翻页模式的多栏由内嵌脚本按「栏宽 = 视口宽」动态设置（见 ReaderScript），
+            // 这里只保证容器能横向滚动、并且不参与纵向滚动。
             """
-            html { overflow-x: auto; overflow-y: hidden; }
-            body {
-              height: ${viewHeightPx}px;
-              padding: 8px ${pad}px;
-              box-sizing: border-box;
-              column-width: ${(viewWidthPx - pad * 2).coerceAtLeast(120)}px;
-              column-gap: ${pad * 2}px;
-              column-fill: auto;
-            }
+            body { padding: 0; margin: 0; }
+            #tsu-view { -webkit-overflow-scrolling: touch; }
             """.trimIndent()
         }
 
@@ -776,7 +1518,18 @@ private fun cssFor(
     } else {
         "img, video, svg { max-width: 100%; height: auto; }"
     }
-    val breakRule = if (paged) "h1, h2, h3 { break-after: avoid; }" else ""
+    // 翻页模式下必须压住 EPUB 自带的固定宽度/分栏，否则内容会溢出页面、页码与实际位置脱节。
+    val pagedGuard = if (paged) {
+        // 不能在这里用 !important 压 column-*/height：脚本是用行内样式设置分栏的，
+        // 行内样式打不过 !important，压了就等于把分栏关掉。
+        """
+        body { overflow: visible !important; }
+        img, svg, video, table, pre { max-width: 100% !important; }
+        p, div, h1, h2, h3, h4, h5, h6 { break-inside: auto; }
+        """.trimIndent()
+    } else {
+        ""
+    }
     return """
     html, body {
       margin: 0;
@@ -791,15 +1544,18 @@ private fun cssFor(
       word-wrap: break-word;
     }
     $blockFlow
-    p { margin: 0 0 ${s.paragraphSpacing}em 0; text-indent: ${s.textIndent}em; }
+    $pagedGuard
+    p { margin: 0 0 ${s.paragraphSpacing}em 0; text-indent: ${s.textIndent}em; letter-spacing: ${s.letterSpacing}em; word-spacing: ${s.wordSpacing}em; ${if (s.justify) "text-align: justify; text-justify: inter-ideograph;" else ""} }
     $media
     h1, h2, h3 { line-height: 1.45; margin: 1em 0 0.6em; }
-    $breakRule
     a { color: inherit; }
     pre { white-space: pre-wrap; }
+    ::highlight(tsu-hl-0) { background-color: rgba(255, 224, 130, ${s.highlightOpacity}); }
+    ::highlight(tsu-hl-1) { background-color: rgba(165, 214, 167, ${s.highlightOpacity}); }
+    ::highlight(tsu-hl-2) { background-color: rgba(144, 202, 249, ${s.highlightOpacity}); }
+    ::highlight(tsu-hl-3) { background-color: rgba(244, 143, 177, ${s.highlightOpacity}); }
 """.trimIndent()
 }
-
 @Suppress("UnusedReceiverParameter")
 @Composable
 private fun ChapterView(
@@ -808,21 +1564,112 @@ private fun ChapterView(
     readerSettings: ReaderSettings,
     theme: ReaderTheme,
     initialOffset: Int,
+    initialRatio: Float,
+    turnController: ReaderTurnController,
+    annotationsJson: String,
+    pendingFind: String?,
+    onSelectionJson: (String) -> Unit,
+    onSelectionCleared: () -> Unit,
+    onHighlightTap: (String) -> Unit,
+    onFindConsumed: () -> Unit,
     onPosition: (offset: Int, atEnd: Boolean) -> Unit,
     onPageChanged: (page: Int, pageCount: Int) -> Unit,
+    onEdgeTurn: (forward: Boolean) -> Unit,
+    onMenuTap: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     BoxWithConstraints(modifier = modifier) {
-        // CSS px == dp here (viewport meta width=device-width, initial-scale=1), so the measured
-        // size in dp is directly usable as a CSS length.
         val viewWidthPx = maxWidth.value.roundToInt().coerceAtLeast(1)
         val viewHeightPx = maxHeight.value.roundToInt().coerceAtLeast(1)
-        val paged = readerSettings.layout == ReaderLayout.PAGED &&
-            readerSettings.writingMode != ReaderWritingMode.VERTICAL
+        val density = LocalDensity.current.density
+        val vertical = readerSettings.writingMode == ReaderWritingMode.VERTICAL
+        // 竖排的栏轴与横排相反，暂不做多栏分页（滚动模式可用）
+        val paged = readerSettings.layout == ReaderLayout.PAGED && !vertical
 
-        // 非 Compose 状态：记录当前偏移，供「设置变更后重新加载」时回到原处。
+        // 非 Compose 状态：记录当前偏移/相对位置，供「设置变更后重新加载」时回到原处。
         val lastOffset = remember(localPath, html) { intArrayOf(initialOffset.coerceAtLeast(0)) }
+        val lastRatio = remember(localPath, html) { floatArrayOf(0f) }
+        // 上一次真正加载时用的 key：只有它变了才允许重新 loadData。
+        val loadedKey = remember(localPath, html) { arrayOfNulls<String>(1) }
         var webRef by remember { mutableStateOf<ReaderWebView?>(null) }
+
+        val positionCb = rememberUpdatedState(onPosition)
+        val pageCb = rememberUpdatedState(onPageChanged)
+        val edgeCb = rememberUpdatedState(onEdgeTurn)
+        val menuCb = rememberUpdatedState(onMenuTap)
+        val selectionCb = rememberUpdatedState(onSelectionJson)
+        val selectionClearedCb = rememberUpdatedState(onSelectionCleared)
+        val highlightTapCb = rememberUpdatedState(onHighlightTap)
+        val findConsumedCb = rememberUpdatedState(onFindConsumed)
+        val appliedHighlights = remember(localPath, html) { arrayOfNulls<String>(1) }
+
+        // 翻页动画：把旧页截成位图盖在上面滑动/淡出（WebView 自己无法做翻页动画）
+        var turnFx by remember { mutableStateOf<TurnSnapshot?>(null) }
+        val animProgress = remember { Animatable(1f) }
+        LaunchedEffect(turnFx) {
+            val current = turnFx ?: return@LaunchedEffect
+            animProgress.snapTo(0f)
+            val duration = if (current.style == ReaderPageAnim.FADE) 150 else 220
+            animProgress.animateTo(1f, tween(durationMillis = duration, easing = LinearEasing))
+            turnFx = null
+            current.bitmap.recycle()
+        }
+
+        fun doTurn(forward: Boolean) {
+
+            val web = webRef ?: return
+            val style = readerSettings.pageAnim
+            val snap = if (style != ReaderPageAnim.NONE) web.snapshot() else null
+            web.turnPage(forward) { moved ->
+                if (!moved) {
+                    snap?.recycle()
+                    edgeCb.value(forward)
+                } else if (snap != null) {
+                    turnFx = TurnSnapshot(snap, forward, style, web.width)
+                }
+            }
+        }
+
+        LaunchedEffect(pendingFind) {
+            val query = pendingFind ?: return@LaunchedEffect
+            webRef?.findText(query)
+            findConsumedCb.value()
+        }
+
+        DisposableEffect(turnController) {
+            turnController.turn = { forward -> doTurn(forward) }
+            onDispose { turnController.turn = null }
+        }
+
+        // 正文 / 排版 / 视口任何一项变化才需要重新排版，普通重组（例如页码变化）不得重排。
+        val loadKey = remember(
+            localPath,
+            html,
+            theme,
+            readerSettings,
+            viewWidthPx,
+            viewHeightPx,
+        ) {
+            listOf(
+                localPath ?: html?.hashCode()?.toString() ?: "empty",
+                theme.name,
+                readerSettings.fontSize,
+                readerSettings.fontFamily,
+                readerSettings.fontWeight,
+                readerSettings.lineHeight,
+                readerSettings.paragraphSpacing,
+                readerSettings.textIndent,
+                readerSettings.horizontalPadding,
+                readerSettings.writingMode,
+                readerSettings.layout,
+                readerSettings.letterSpacing,
+                readerSettings.wordSpacing,
+                readerSettings.justify,
+                readerSettings.tapZone.key,
+                viewWidthPx,
+                viewHeightPx,
+            ).joinToString("|")
+        }
 
         AndroidView(
             modifier = Modifier
@@ -830,12 +1677,16 @@ private fun ChapterView(
                 .background(Color(android.graphics.Color.parseColor(theme.bg))),
             factory = { context ->
                 ReaderWebView(context).apply {
-                    settings.javaScriptEnabled = false
-                    settings.useWideViewPort = true
+                    // 脚本只读 DOM 并把页码报给桥；加载前会清掉 EPUB 自带的脚本与内联事件
+                    settings.javaScriptEnabled = true
+                    // 让我们注入的 viewport meta 生效，否则 innerWidth 与真实排版宽度不一致
+                    settings.useWideViewPort = false
                     settings.loadWithOverviewMode = false
                     settings.textZoom = 100
                     settings.setSupportZoom(false)
                     settings.builtInZoomControls = false
+                    isVerticalScrollBarEnabled = false
+                    isHorizontalScrollBarEnabled = false
                     setBackgroundColor(android.graphics.Color.TRANSPARENT)
                     // 阅读器不应该能把用户带出当前章节（点外链/广告位）
                     webViewClient = object : WebViewClient() {
@@ -845,127 +1696,399 @@ private fun ChapterView(
                         ): Boolean = true
 
                         override fun onPageFinished(view: WebView, url: String?) {
-                            (view as? ReaderWebView)?.applyRestore()
+                            (view as? ReaderWebView)?.onDocumentFinished()
                         }
                     }
-                    onOffset = { offset, atEnd ->
-                        lastOffset[0] = offset
-                        onPosition(offset, atEnd)
+                    // 脚本失效只会表现为「页码不动」，所以把 console 与异常都打到日志里
+                    webChromeClient = object : android.webkit.WebChromeClient() {
+                        override fun onConsoleMessage(message: android.webkit.ConsoleMessage): Boolean {
+                            android.util.Log.w(
+                                "TSUNDOKU_JS",
+                                "${message.message()} @${message.lineNumber()}",
+                            )
+                            return true
+                        }
                     }
-                    onPage = { page, pages -> onPageChanged(page, pages) }
+                    onOffset = { offset, atEnd, ratio ->
+                        lastOffset[0] = offset
+                        lastRatio[0] = ratio
+                        positionCb.value(offset, atEnd)
+                    }
+                    onPage = { page, pages -> pageCb.value(page, pages) }
+                    onTapZone = { delta -> doTurn(delta > 0) }
+                    this.onMenuTap = { menuCb.value.invoke() }
+                    this.onSelection = { json -> selectionCb.value(json) }
+                    this.onSelectionCleared = { selectionClearedCb.value() }
+                    this.onHighlightTap = { id -> highlightTapCb.value(id) }
                 }.also { webRef = it }
             },
             update = { web ->
                 val style = cssFor(theme, readerSettings, viewWidthPx, viewHeightPx)
                 web.pagedMode = paged
-                web.restoreOffset = lastOffset[0]
-            when {
-                localPath != null -> {
-                    val file = File(localPath)
-                    val raw = runCatching { file.readText() }.getOrNull()
-                    if (raw != null) {
-                        val meta = "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-                        val injected = if (raw.contains("</head>", ignoreCase = true)) {
-                            raw.replaceFirst(
-                                "</head>",
-                                "$meta<style>$style</style></head>",
-                                ignoreCase = true,
-                            )
-                        } else {
-                            "$meta<style>$style</style>$raw"
-                        }
-                        web.loadDataWithBaseURL(
-                            "file://${file.parentFile?.absolutePath}/",
-                            injected,
-                            "text/html",
-                            "utf-8",
-                            null,
-                        )
-                    }
+                // 关键：只有 loadKey 变了才重新加载文档。
+                if (loadedKey[0] != loadKey) {
+                    val firstLoad = loadedKey[0] == null
+                    loadedKey[0] = loadKey
+                    web.restoreOffset = lastOffset[0]
+                    // 换字号/行距这类重排，用相对位置还原比绝对偏移更准
+                    web.restoreRatio = if (firstLoad) initialRatio else lastRatio[0]
+                    web.beginLoad()
+                    val script = ReaderScript.build(
+                        paged = paged,
+                        padPx = readerSettings.horizontalPadding,
+                        tapZone = readerSettings.tapZone,
+                        vwDp = viewWidthPx,
+                        vhDp = viewHeightPx,
+                        density = density,
+                    )
+                    loadContent(
+                        web = web,
+                        html = html,
+                        localPath = localPath,
+                        style = style,
+                        script = script,
+                        viewWidthDp = viewWidthPx,
+                        viewHeightDp = viewHeightPx,
+                    )
+                    appliedHighlights[0] = null
                 }
-
-                html != null -> web.loadDataWithBaseURL(
-                    null,
-                    "<!doctype html><html><head><meta charset=\"utf-8\">" +
-                        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
-                        "<style>$style</style></head><body>$html</body></html>",
-                    "text/html",
-                    "utf-8",
-                    null,
-                )
-
-                else -> Unit
+                // 批注变化时重新渲染高亮；文档刚载入时也补一次
+                if (appliedHighlights[0] != annotationsJson) {
+                    appliedHighlights[0] = annotationsJson
+                    web.applyHighlights(annotationsJson)
                 }
             },
         )
 
-        if (paged) {
-            Box(
+        turnFx?.let { current ->
+            val progress = animProgress.value
+            val width = current.width.coerceAtLeast(1).toFloat()
+            val direction = if (current.forward) -1f else 1f
+            Image(
+                bitmap = current.bitmap.asImageBitmap(),
+                contentDescription = null,
+                contentScale = ContentScale.FillBounds,
                 modifier = Modifier
                     .fillMaxSize()
-                    .pointerInput(viewWidthPx) {
-                        var dragged = 0f
-                        detectHorizontalDragGestures(
-                            onDragStart = { dragged = 0f },
-                            onDragEnd = {
-                                val web = webRef ?: return@detectHorizontalDragGestures
-                                val step = web.width.coerceAtLeast(1)
-                                val before = web.scrollX
-                                when {
-                                    dragged <= -40f -> web.scrollBy(step, 0)
-                                    dragged >= 40f -> web.scrollBy(-step, 0)
-                                    else -> return@detectHorizontalDragGestures
-                                }
-                                web.post {
-                                    val page = (web.scrollX / step).coerceAtLeast(0)
-                                    // 往前翻却纹丝不动 = 已经在最后一页，本章读完
-                                    val atEnd = dragged <= -40f && web.scrollX == before
-                                    web.publishPosition(page, atEnd)
-                                }
-                            },
-                            onHorizontalDrag = { _, amount -> dragged += amount },
-                        )
+                    .graphicsLayer {
+                        when (current.style) {
+                            ReaderPageAnim.FADE -> alpha = 1f - progress
+                            ReaderPageAnim.COVER -> {
+                                translationX = direction * width * progress
+                                shadowElevation = 24f
+                            }
+                            else -> translationX = direction * width * progress
+                        }
                     },
             )
         }
     }
 }
 
+/** 翻页动画用的旧页快照。 */
+private class TurnSnapshot(
+    val bitmap: android.graphics.Bitmap,
+    val forward: Boolean,
+    val style: ReaderPageAnim,
+    val width: Int,
+)
+
+/** 让屏幕级控件（音量键、底部按钮）驱动翻页。 */
+private class ReaderTurnController {
+    var turn: ((forward: Boolean) -> Unit)? = null
+}
+
+/** 把任意文本编码成单引号 JS 字符串字面量。 */
+private fun jsStringLiteral(value: String): String {
+    val escaped = value
+        .replace("\\", "\\\\")
+        .replace("'", "\\'")
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    return "'" + escaped + "'"
+}
+
+/** 把正文塞进 WebView（EPUB 用本地文件，网页/TXT 用内存 HTML），并注入分页脚本。 */private fun loadContent(
+    web: WebView,
+    html: String?,
+    localPath: String?,
+    style: String,
+    script: String,
+    viewWidthDp: Int,
+    viewHeightDp: Int,
+) {
+    // 写死视口宽高（dp = CSS 像素）：device-width 在不同加载下会解析成不同的布局宽度
+    val meta = "<meta name=\"viewport\" content=\"width=$viewWidthDp, " +
+        "height=$viewHeightDp, initial-scale=1, user-scalable=no\">"
+    when {
+        localPath != null -> {
+            val file = File(localPath)
+            val raw = runCatching { file.readText() }.getOrNull() ?: return
+            var doc = sanitizeForScript(raw)
+            doc = if (doc.contains("</head>", ignoreCase = true)) {
+                doc.replaceFirst("</head>", "$meta<style>$style</style></head>", ignoreCase = true)
+            } else {
+                "$meta<style>$style</style>$doc"
+            }
+            doc = if (doc.contains("</body>", ignoreCase = true)) {
+                doc.replaceFirst("</body>", "<script>$script</script></body>", ignoreCase = true)
+            } else {
+                "$doc<script>$script</script>"
+            }
+            web.loadDataWithBaseURL(
+                "file://${file.parentFile?.absolutePath}/",
+                doc,
+                "text/html",
+                "utf-8",
+                null,
+            )
+        }
+
+        html != null -> web.loadDataWithBaseURL(
+            null,
+            "<!doctype html><html><head><meta charset=\"utf-8\">$meta<style>$style</style></head>" +
+                "<body>$html<script>$script</script></body></html>",
+            "text/html",
+            "utf-8",
+            null,
+        )
+    }
+}
+
+private val SCRIPT_TAG = Regex("(?is)<script\\b[^>]*>.*?</script>|<script\\b[^>]*/>")
+private val INLINE_HANDLER = Regex("(?i)\\s+on[a-z]+\\s*=\\s*(\"[^\"]*\"|'[^']*'|[^\\s>]+)")
+
+/** 清掉正文自带的脚本与内联事件：分页桥只该被我们自己的脚本调用。 */
+internal fun sanitizeForScript(raw: String): String =
+    raw.replace(SCRIPT_TAG, "").replace(INLINE_HANDLER, "")
+
 /**
- * 阅读器用的 WebView：
- * - 滚动时上报位置（滚动模式 = scrollY，翻页模式 = 页码）
- * - 重新加载后恢复到上次位置（换字号/主题不会丢失阅读位置）
+ * 阅读器用的 WebView。
+ *
+ * 位置与页码优先由内嵌脚本上报（见 [ReaderScript]）：脚本在自己的 CSS 像素坐标系里测量行盒与滚动，
+ * 因此不存在 CSS 像素 / 物理像素混用导致的错位与半行残字。
+ * 脚本没有回报时（被禁用或异常）退回「按视口高度整页滚动」（[PagerMath]）。
  */
 private class ReaderWebView(context: android.content.Context) : WebView(context) {
 
     var pagedMode: Boolean = false
     var restoreOffset: Int = 0
-    var onOffset: ((offset: Int, atEnd: Boolean) -> Unit)? = null
-    var onPage: ((page: Int, pageCount: Int) -> Unit)? = null
 
-    override fun onScrollChanged(l: Int, t: Int, oldl: Int, oldt: Int) {
-        super.onScrollChanged(l, t, oldl, oldt)
-        val step = width.coerceAtLeast(1)
+    /** >= 0 时按相对位置还原（换字号/行距后的重排更准）。 */
+    var restoreRatio: Float = -1f
+
+    var onOffset: ((offset: Int, atEnd: Boolean, ratio: Float) -> Unit)? = null
+    var onPage: ((page: Int, pageCount: Int) -> Unit)? = null
+    var onTapZone: ((delta: Int) -> Unit)? = null
+    var onMenuTap: (() -> Unit)? = null
+    var onSelection: ((json: String) -> Unit)? = null
+    var onSelectionCleared: (() -> Unit)? = null
+    var onHighlightTap: ((id: String) -> Unit)? = null
+
+    private var jsActive = false
+    private var restoreApplied = false
+
+    private var fallbackMaxScroll = 0
+    private var fallbackMeasuring = false
+    private var fallbackRestorePass = 0
+    private var fallbackUserMoved = false
+    private var fallbackRestored = false
+
+    private val bridge = PaginationBridge(
+        onReady = { post { onScriptReady() } },
+        onState = { page, pages, ratio, atEnd ->
+            post { onScriptState(page, pages, ratio, atEnd) }
+        },
+        onTap = { delta -> post { onTapZone?.invoke(delta) } },
+        onMenu = { post { onMenuTap?.invoke() } },
+        onSelection = { json -> post { onSelection?.invoke(json) } },
+        onSelectionCleared = { post { onSelectionCleared?.invoke() } },
+        onHighlightTap = { id -> post { onHighlightTap?.invoke(id) } },
+        onDebug = { message -> android.util.Log.d("TSUNDOKU_JS", message) },
+    )
+
+    init {
+        runCatching { addJavascriptInterface(bridge, BRIDGE_NAME) }
+    }
+
+    // ---------- 脚本路径 ----------
+
+    private fun onScriptReady() {
+        jsActive = true
+        applyRestore()
+    }
+
+    private fun onScriptState(page: Int, pages: Int, ratio: Float, atEnd: Boolean) {
+        jsActive = true
+        restoreApplied = true
         if (pagedMode) {
-            publishPosition((scrollX / step).coerceAtLeast(0), false)
+            onPage?.invoke(page, pages)
+            onOffset?.invoke(page, atEnd, ratio)
         } else {
-            val atEnd = contentHeight > 0 && scrollY + height >= contentHeight - 24
-            onOffset?.invoke(scrollY, atEnd)
+            // 滚动模式没有页码，把相对位置编码成整数存库，还原时仍优先用比例
+            onOffset?.invoke((ratio * RATIO_SCALE).toInt(), atEnd, ratio)
         }
     }
 
-    fun publishPosition(page: Int, atEnd: Boolean) {
-        onPage?.invoke(page, 0)
-        onOffset?.invoke(page, atEnd)
+    fun beginLoad() {
+        restoreApplied = false
+        fallbackRestored = false
+        fallbackMeasuring = false
+        fallbackRestorePass = 0
+        fallbackUserMoved = false
+    }
+
+    /** 正文载入完成：脚本通常会自己上报 ready，没上报才走回退路径。 */
+    fun onDocumentFinished() {
+        postDelayed({
+            if (jsActive) {
+                if (!restoreApplied) applyRestore()
+            } else {
+                prepareFallback()
+            }
+        }, 300)
     }
 
     fun applyRestore() {
-        val step = width.coerceAtLeast(1)
-        val target = restoreOffset.coerceAtLeast(0)
-        if (pagedMode) scrollTo(target * step, 0) else scrollTo(0, target)
-        post {
-            if (pagedMode) publishPosition((scrollX / step).coerceAtLeast(0), false)
+        if (!jsActive) {
+            applyFallbackRestore()
+            return
         }
+        val js = when {
+            restoreRatio >= 0f ->
+                "window.__tsu&&window.__tsu.ratio(${formatRatio(restoreRatio)})"
+            pagedMode ->
+                "window.__tsu&&window.__tsu.page(${restoreOffset.coerceAtLeast(0)})"
+            else ->
+                "window.__tsu&&window.__tsu.ratio(${formatRatio(restoreOffset.coerceAtLeast(0) / RATIO_SCALE)})"
+        }
+        evaluateJavascript(js, null)
+        restoreApplied = true
+    }
+
+    /** 翻一页；回调 false 表示已经在章首/章末，调用方据此切章。 */
+    fun turnPage(forward: Boolean, onResult: (Boolean) -> Unit) {
+        fallbackUserMoved = true
+        if (jsActive) {
+            val delta = if (forward) 1 else -1
+            evaluateJavascript("window.__tsu&&window.__tsu.turn($delta)") { result ->
+                onResult(result != null && result.contains("true"))
+            }
+            return
+        }
+        onResult(fallbackTurn(forward))
+    }
+
+    /** 注入当前章节的批注并渲染高亮。 */
+    fun applyHighlights(json: String) {
+        evaluateJavascript("window.__tsu&&window.__tsu.highlights(" + jsStringLiteral(json) + ")", null)
+    }
+
+    /** 定位到某段文字（全书搜索跳转）。 */
+    fun findText(text: String) {
+        evaluateJavascript("window.__tsu&&window.__tsu.find(" + jsStringLiteral(text) + ")", null)
+    }
+
+    fun clearSelection() {
+        evaluateJavascript("window.__tsu&&window.__tsu.clearSelection()", null)
+    }
+
+    /** 把当前页截成位图，供翻页动画使用。 */    fun snapshot(): android.graphics.Bitmap? = runCatching {
+        if (width <= 0 || height <= 0) return null
+        val bitmap = android.graphics.Bitmap.createBitmap(
+            width,
+            height,
+            android.graphics.Bitmap.Config.ARGB_8888,
+        )
+        draw(android.graphics.Canvas(bitmap))
+        bitmap
+    }.getOrNull()
+
+    private fun formatRatio(value: Float): String =
+        String.format(Locale.US, "%.5f", value.coerceIn(0f, 1f))
+
+    // ---------- 回退路径（脚本不可用时） ----------
+
+    private val fallbackPageHeight: Int get() = height.coerceAtLeast(1)
+
+    private fun fallbackMaxScrollY(): Int =
+        (computeVerticalScrollRange() - computeVerticalScrollExtent()).coerceAtLeast(0)
+
+    private fun prepareFallback() {
+        if (fallbackMeasuring) return
+        fallbackRestored = true
+        fallbackMaxScroll = fallbackMaxScrollY()
+        if (scrollY > fallbackMaxScroll) {
+            fallbackMeasuring = true
+            scrollTo(scrollX, fallbackMaxScroll)
+            fallbackMeasuring = false
+        }
+        if (fallbackRestorePass == 0) {
+            applyFallbackRestore()
+        } else if (fallbackRestorePass == 1 && !fallbackUserMoved) {
+            applyFallbackRestore()
+        }
+        fallbackPublish()
+    }
+
+    private fun applyFallbackRestore() {
+        fallbackRestorePass++
+        val max = fallbackMaxScrollY()
+        fallbackMaxScroll = max
+        val target = when {
+            restoreRatio >= 0f -> PagerMath.offsetForRatio(restoreRatio, max)
+            pagedMode -> PagerMath.pageOffset(restoreOffset.coerceAtLeast(0), max, fallbackPageHeight)
+            else -> restoreOffset.coerceIn(0, max)
+        }
+        if (target != scrollY) {
+            fallbackMeasuring = true
+            scrollTo(scrollX, target)
+            fallbackMeasuring = false
+        }
+        fallbackRestored = true
+        fallbackPublish()
+    }
+
+    private fun fallbackTurn(forward: Boolean): Boolean {
+        if (fallbackMeasuring) return false
+        fallbackMaxScroll = fallbackMaxScrollY()
+        val before = scrollY
+        val target = PagerMath.targetPageScroll(before, forward, fallbackMaxScroll, fallbackPageHeight)
+        if (target == before) return false
+        scrollTo(scrollX, target)
+        if (scrollY == before) return false
+        fallbackPublish()
+        return true
+    }
+
+    private fun fallbackPublish() {
+        if (fallbackMeasuring || !fallbackRestored) return
+        fallbackMaxScroll = fallbackMaxScrollY()
+        val ratio = PagerMath.ratio(scrollY, fallbackMaxScroll)
+        val atEnd = PagerMath.isAtEnd(scrollY, fallbackMaxScroll, if (pagedMode) 2 else 24)
+        if (pagedMode) {
+            onPage?.invoke(
+                PagerMath.pageOf(scrollY, fallbackMaxScroll, fallbackPageHeight),
+                PagerMath.pageCount(fallbackMaxScroll, fallbackPageHeight),
+            )
+            onOffset?.invoke(
+                PagerMath.pageOf(scrollY, fallbackMaxScroll, fallbackPageHeight),
+                atEnd,
+                ratio,
+            )
+        } else {
+            onOffset?.invoke(scrollY, atEnd, ratio)
+        }
+    }
+
+    private companion object {
+        const val BRIDGE_NAME = "TsundokuBridge"
+
+
+        /** 滚动模式把比例编码成整数存库时的倍数。 */
+        const val RATIO_SCALE = 1_000_000f
     }
 }
 
