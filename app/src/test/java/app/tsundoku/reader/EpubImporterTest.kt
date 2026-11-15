@@ -143,4 +143,92 @@ class EpubImporterTest {
         assertNotNull(error)
         assertFalse(dest.exists())
     }
+
+    // --- 元数据兜底 ---
+
+    private fun epubWith(
+        title: String,
+        spine: String = """<itemref idref="c1"/>""",
+        chapters: Map<String, String> = mapOf(
+            "OEBPS/chapter1.xhtml" to
+                "<html><head><title>Chapter One</title></head><body><p>x</p></body></html>",
+        ),
+        manifestExtra: String = "",
+    ): File {
+        val file = temp.newFile("book-${System.nanoTime()}.epub")
+        ZipOutputStream(file.outputStream()).use { out ->
+            fun put(name: String, body: String) {
+                out.putNextEntry(ZipEntry(name))
+                out.write(body.toByteArray())
+                out.closeEntry()
+            }
+            put("mimetype", "application/epub+zip")
+            put(
+                "META-INF/container.xml",
+                """<?xml version="1.0"?><container><rootfiles>
+                   <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+                   </rootfiles></container>""",
+            )
+            val items = chapters.keys.mapIndexed { index, href ->
+                """<item id="c${index + 1}" href="${href.substringAfterLast('/')}" media-type="application/xhtml+xml"/>"""
+            }.joinToString("")
+            put(
+                "OEBPS/content.opf",
+                """<?xml version="1.0"?><package version="2.0"><metadata
+                   xmlns:dc="http://purl.org/dc/elements/1.1/">
+                   <dc:title>$title</dc:title>
+                   </metadata><manifest>$items$manifestExtra</manifest>
+                   <spine>$spine</spine></package>""",
+            )
+            chapters.forEach { (path, body) -> put(path, body) }
+        }
+        return file
+    }
+
+    @Test
+    fun numericTitleFallsBackToFileName() = runBlocking {
+        val epub = epubWith(title = "12345")
+        val dest = temp.newFolder("dest-title")
+        val result = EpubImporter().extract(epub, dest)
+        // 文件名是 book-<nanos>.epub，所以标题应该来自文件名而不是 "12345"
+        assertFalse("纯数字书名应被替换，实际=${result.title}", result.title == "12345")
+        assertTrue(result.title.startsWith("book"))
+    }
+
+    @Test
+    fun numericChapterTitleFallsBackToHeading() = runBlocking {
+        val html = "<html><head><title>3</title></head><body><h2>第六卷 序</h2><p>正文</p></body></html>"
+        val epub = epubWith(title = "Real Title", chapters = mapOf("OEBPS/chapter1.xhtml" to html))
+        val dest = temp.newFolder("dest-ch-title")
+        val result = EpubImporter().extract(epub, dest)
+        assertEquals("Real Title", result.title)
+        assertEquals("第六卷 序", result.chapters.single().title)
+    }
+
+    @Test
+    fun junkChapterTitlesGetOrdinalNames() = runBlocking {
+        val html = "<html><head><title>1</title></head><body><h1>1</h1><p>正文</p></body></html>"
+        val epub = epubWith(
+            title = "Real Title",
+            spine = """<itemref idref="c1"/><itemref idref="c2"/>""",
+            chapters = mapOf("OEBPS/a.xhtml" to html, "OEBPS/b.xhtml" to html),
+        )
+        val dest = temp.newFolder("dest-junk-title")
+        val result = EpubImporter().extract(epub, dest)
+        assertEquals(listOf("第 1 章", "第 2 章"), result.chapters.map { it.title })
+    }
+
+    @Test
+    fun nonLinearSpineItemsAreSkipped() = runBlocking {        val one = "<html><head><title>第一章 开始</title></head><body><p>a</p></body></html>"
+        val note = "<html><head><title>注释</title></head><body><p>n</p></body></html>"
+        val epub = epubWith(
+            title = "Book",
+            spine = """<itemref idref="c1"/><itemref idref="c2" linear="no"/>""",
+            chapters = mapOf("OEBPS/chapter1.xhtml" to one, "OEBPS/notes.xhtml" to note),
+        )
+        val dest = temp.newFolder("dest-linear")
+        val result = EpubImporter().extract(epub, dest)
+        assertEquals(1, result.chapters.size)
+        assertEquals("第一章 开始", result.chapters.single().title)
+    }
 }

@@ -61,7 +61,8 @@ class EpubImporter {
         val opf = Jsoup.parse(opfFile.readText(), "", Parser.xmlParser())
         val opfDir = opfPath.substringBeforeLast('/', "")
 
-        val title = firstText(opf, "dc:title", "title") ?: epubFile.nameWithoutExtension
+        val rawTitle = firstText(opf, "dc:title", "title")
+        val title = sanitizeTitle(rawTitle, epubFile)
         val author = firstText(opf, "dc:creator", "creator")
         val description = firstText(opf, "dc:description", "description")
             ?.replace(Regex("<[^>]+>"), "")
@@ -80,17 +81,25 @@ class EpubImporter {
             ?: opf.select("manifest > item")
                 .firstOrNull { it.attr("properties").contains("cover-image") }
                 ?.attr("href")
+            ?: opf.select("manifest > item")
+                .firstOrNull { it.attr("media-type").startsWith("image/") }
+                ?.attr("href")
         val coverFile = coverHref?.let { href ->
             runCatching { resolveInside(destDir, opfDir, href) }.getOrNull()?.takeIf { it.exists() }
         }
 
-        val chapters = opf.select("spine > itemref").mapNotNull { itemRef ->
+        // linear="no" 的条目（脚注、版权页）默认不进阅读顺序；若全书都是 no，则全部保留。
+        val spineItems = opf.select("spine > itemref")
+        val linearItems = spineItems.filter { !it.attr("linear").equals("no", ignoreCase = true) }
+        val ordered = linearItems.ifEmpty { spineItems }
+
+        val chapters = ordered.mapIndexedNotNull { index, itemRef ->
             val idRef = itemRef.attr("idref")
-            val href = manifest[idRef] ?: return@mapNotNull null
+            val href = manifest[idRef] ?: return@mapIndexedNotNull null
             val file = runCatching { resolveInside(destDir, opfDir, href) }.getOrNull()
-                ?: return@mapNotNull null
-            if (!file.exists()) return@mapNotNull null
-            val label = readChapterTitle(file) ?: file.nameWithoutExtension
+                ?: return@mapIndexedNotNull null
+            if (!file.exists()) return@mapIndexedNotNull null
+            val label = chapterTitle(file, index + 1) ?: file.nameWithoutExtension
             ChapterFile(title = label, path = file.absolutePath)
         }
 
@@ -103,10 +112,42 @@ class EpubImporter {
         )
     }
 
-    private fun readChapterTitle(file: File): String? = runCatching {
-        Jsoup.parse(file.readText()).selectFirst("title")?.text()?.trim()
-            ?.takeIf { it.isNotEmpty() }
+    /**
+     * 章节标题：`<title>` 可用就用；纯数字/单字符/占位的，退到正文标题标签，
+     * 都不可用时给「第 N 章」——比把正文首句当标题稳定得多。
+     */
+    private fun chapterTitle(file: File, ordinal: Int): String? = runCatching {
+        val doc = Jsoup.parse(file.readText())
+        val fromTitle = doc.selectFirst("title")?.text()?.trim().orEmpty()
+        if (isMeaningfulTitle(fromTitle)) return@runCatching fromTitle
+
+        val fromHeading = doc.selectFirst("h1, h2, h3, h4")?.text()?.trim().orEmpty()
+        if (isMeaningfulTitle(fromHeading)) return@runCatching fromHeading
+
+        "第 $ordinal 章"
     }.getOrNull()
+
+    /** 纯数字、纯分隔符、单字符都算「不像标题」。注意不能用 \W，Java 里它对中文恒为真。 */
+    private fun isMeaningfulTitle(value: String): Boolean =
+        value.length >= 2 && !JUNK_TITLE.matches(value)
+
+    /**
+     * 书名兜底：`dc:title` 是纯数字/与文件名相同/明显占位时，用文件名（去掉扩展名与分隔符）。
+     */
+    private fun sanitizeTitle(raw: String?, epubFile: File): String {
+        val fromFile = epubFile.nameWithoutExtension
+            .replace(Regex("""[+_\s]+"""), " ")
+            .trim()
+        val title = raw?.trim().orEmpty()
+        val looksJunk = title.isEmpty() ||
+            title.length < 2 ||
+            JUNK_TITLE.matches(title) ||
+            title.equals(fromFile, ignoreCase = true) ||
+            title.contains("untitled", ignoreCase = true) ||
+            title.contains("未命名") ||
+            title.contains("无标题")
+        return if (looksJunk) fromFile.ifBlank { "未命名书籍" } else title
+    }
 
     /** OPF 中的元数据标签带命名空间前缀（dc:title），按标签名逐个尝试。 */
     private fun firstText(root: Element, vararg tags: String): String? {
@@ -184,5 +225,8 @@ class EpubImporter {
         const val MAX_ENTRIES = 5_000
         const val MAX_ENTRY_BYTES = 128L * 1024 * 1024
         const val MAX_TOTAL_BYTES = 512L * 1024 * 1024
+
+        /** 只有数字 + 常见分隔符（不含字母/汉字）才算垃圾标题。 */
+        private val JUNK_TITLE = Regex("""^[\d\s+_.\-]+$""")
     }
 }

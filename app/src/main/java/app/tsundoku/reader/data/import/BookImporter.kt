@@ -96,21 +96,9 @@ class BookImporter(
     }
 
     private suspend fun importTxt(file: File, title: String): Long {
-        val drafts = TxtImporter.split(TxtImporter.readText(file))
-        if (drafts.isEmpty()) throw IOException("文件内容为空")
         val now = System.currentTimeMillis()
-        val chapters = drafts.mapIndexed { index, draft ->
-            ChapterEntity(
-                bookId = 0,
-                idx = index,
-                title = draft.title,
-                url = "",
-                content = draft.html,
-                read = false,
-                updatedAt = now,
-            )
-        }
-        return library.insertBook(
+        // 先建书，再边解析边分批写章节，避免把整本书的章节同时放进内存。
+        val bookId = library.insertBook(
             book = BookEntity(
                 title = title.ifBlank { "未命名书籍" },
                 author = null,
@@ -126,8 +114,33 @@ class BookImporter(
                 pageCount = 0,
                 updatedAt = now,
             ),
-            chapters = chapters,
+            chapters = emptyList(),
         )
+        var index = 0
+        val result = try {
+            TxtImporter.import(file) { batch ->
+                val entities = batch.map { draft ->
+                    ChapterEntity(
+                        bookId = bookId,
+                        idx = index++,
+                        title = draft.title,
+                        url = "",
+                        content = draft.html,
+                        read = false,
+                        updatedAt = now,
+                    )
+                }
+                library.saveChapters(bookId, entities)
+            }
+        } catch (error: Throwable) {
+            library.delete(bookId)
+            throw error
+        }
+        if (result.chapterCount == 0) {
+            library.delete(bookId)
+            throw IOException("文件内容为空")
+        }
+        return bookId
     }
 
     private suspend fun importEpub(file: File, folder: File, fallbackTitle: String): Long {
