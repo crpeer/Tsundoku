@@ -15,6 +15,11 @@ import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.wrapContentSize
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.AnnotatedString
+import app.tsundoku.reader.data.repo.HIGHLIGHT_COLORS
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -37,8 +42,17 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.List
+import androidx.compose.material.icons.outlined.BookmarkAdd
+import androidx.compose.material.icons.outlined.ContentCopy
+import androidx.compose.material.icons.outlined.EditNote
+import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.StickyNote2
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
@@ -72,6 +86,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -79,6 +94,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
+import app.tsundoku.reader.data.local.AnnotationEntity
+import app.tsundoku.reader.data.local.BookmarkEntity
 import app.tsundoku.reader.data.prefs.ReaderFontFamily
 import app.tsundoku.reader.data.prefs.ReaderFontWeight
 import app.tsundoku.reader.data.prefs.ReaderLayout
@@ -104,6 +121,11 @@ import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.float
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -111,6 +133,37 @@ import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.util.Locale
 import kotlin.math.roundToInt
+
+/** 当前选中的文字（坐标已换算成物理像素，供 Compose 定位浮动工具条）。 */
+data class SelectionInfo(
+    val text: String,
+    val startPath: String,
+    val startOffset: Int,
+    val endPath: String,
+    val endOffset: Int,
+    val xPx: Float,
+    val yPx: Float,
+    val heightPx: Float,
+)
+
+/** 批注/书签列表里的一行。 */
+data class AnnoItem(
+    val id: String,
+    val text: String,
+    val note: String?,
+    val color: Int,
+    val chapterIndex: Int,
+    val chapterTitle: String,
+    val ratio: Float = 0f,
+)
+
+/** 全书搜索命中的一段文字。 */
+data class SearchHit(
+    val chapterIndex: Int,
+    val chapterTitle: String,
+    val snippet: String,
+    val query: String,
+)
 
 sealed interface ChapterContent {
     data object Loading : ChapterContent
@@ -149,6 +202,37 @@ class ReaderViewModel(
     /** >= 0 时按相对位置打开（回溯到上一章时用它落在章末）。 */
     private val _initialRatio = MutableStateFlow(-1f)
     val initialRatio: StateFlow<Float> = _initialRatio.asStateFlow()
+
+    /** 本书当前章节的批注（JSON，交给脚本渲染高亮）。 */
+    private val _annotationsJson = MutableStateFlow("[]")
+    val annotationsJson: StateFlow<String> = _annotationsJson.asStateFlow()
+
+    private val _annotations = MutableStateFlow<List<AnnoItem>>(emptyList())
+    val annotations: StateFlow<List<AnnoItem>> = _annotations.asStateFlow()
+
+    private val _bookmarks = MutableStateFlow<List<AnnoItem>>(emptyList())
+    val bookmarks: StateFlow<List<AnnoItem>> = _bookmarks.asStateFlow()
+
+    private val _selection = MutableStateFlow<SelectionInfo?>(null)
+    val selection: StateFlow<SelectionInfo?> = _selection.asStateFlow()
+
+    /** 点中已有高亮时要展示的批注 id。 */
+    private val _highlightTap = MutableStateFlow<String?>(null)
+    val highlightTap: StateFlow<String?> = _highlightTap.asStateFlow()
+
+    /** 搜索结果跳转后要在正文里定位的文字。 */
+    private val _pendingFind = MutableStateFlow<String?>(null)
+    val pendingFind: StateFlow<String?> = _pendingFind.asStateFlow()
+
+    private val _searchResults = MutableStateFlow<List<SearchHit>>(emptyList())
+    val searchResults: StateFlow<List<SearchHit>> = _searchResults.asStateFlow()
+
+    private val _pageInfo = MutableStateFlow(0 to 1)
+    val pageInfo: StateFlow<Pair<Int, Int>> = _pageInfo.asStateFlow()
+
+    private var currentSelection: SelectionInfo? = null
+    private var allAnnotations: List<AnnotationEntity> = emptyList()
+    private var allBookmarks: List<BookmarkEntity> = emptyList()
 
     private var loadJob: Job? = null
     private var saveJob: Job? = null
@@ -327,6 +411,201 @@ class ReaderViewModel(
         viewModelScope.launch { container.settings.setJustify(value) }
     }
 
+    // ---------- 批注 / 书签 / 搜索 ----------
+
+    fun onPageChanged(page: Int, pages: Int) {
+        _pageInfo.value = page to pages
+    }
+
+    fun onSelectionJson(json: String) {
+        val info = parseSelection(json) ?: return
+        currentSelection = info
+        _selection.value = info
+    }
+
+    fun onSelectionCleared() {
+        currentSelection = null
+        _selection.value = null
+    }
+
+    fun onHighlightTapped(id: String) {
+        if (allAnnotations.any { it.id == id }) _highlightTap.value = id
+    }
+
+    fun dismissHighlightTap() {
+        _highlightTap.value = null
+    }
+
+    fun addHighlight(color: Int, note: String? = null) {
+        val sel = currentSelection ?: return
+        val current = book.value ?: return
+        val chapterIndex = _index.value
+        val chapterTitle = chapters.value.getOrNull(chapterIndex)?.title ?: ""
+        currentSelection = null
+        _selection.value = null
+        viewModelScope.launch {
+            container.annotations.addAnnotation(
+                bookId = current.id,
+                chapterIndex = chapterIndex,
+                chapterTitle = chapterTitle,
+                startPath = sel.startPath,
+                startOffset = sel.startOffset,
+                endPath = sel.endPath,
+                endOffset = sel.endOffset,
+                text = sel.text,
+                color = color,
+                note = note,
+            )
+            refreshAnnotations()
+            container.meta.sync(current.id)
+        }
+    }
+
+    fun updateAnnotation(id: String, note: String?, color: Int) {
+        val current = book.value ?: return
+        viewModelScope.launch {
+            container.annotations.updateAnnotation(id, note, color)
+            _highlightTap.value = null
+            refreshAnnotations()
+            container.meta.sync(current.id)
+        }
+    }
+
+    fun deleteAnnotation(id: String) {
+        val current = book.value ?: return
+        viewModelScope.launch {
+            container.annotations.deleteAnnotation(id)
+            _highlightTap.value = null
+            refreshAnnotations()
+            container.meta.sync(current.id)
+        }
+    }
+
+    fun addBookmark(note: String? = null) {
+        val current = book.value ?: return
+        val chapterIndex = _index.value
+        val chapterTitle = chapters.value.getOrNull(chapterIndex)?.title ?: ""
+        viewModelScope.launch {
+            container.annotations.addBookmark(
+                bookId = current.id,
+                chapterIndex = chapterIndex,
+                chapterTitle = chapterTitle,
+                offset = currentOffset,
+                ratio = if (_pageInfo.value.second > 1) {
+                    _pageInfo.value.first.toFloat() / (_pageInfo.value.second - 1)
+                } else {
+                    0f
+                },
+                excerpt = null,
+                note = note,
+            )
+            refreshAnnotations()
+            container.meta.sync(current.id)
+            _message.value = "已添加书签"
+        }
+    }
+
+    fun deleteBookmark(id: String) {
+        val current = book.value ?: return
+        viewModelScope.launch {
+            container.annotations.deleteBookmark(id)
+            refreshAnnotations()
+            container.meta.sync(current.id)
+        }
+    }
+
+    fun search(query: String) {
+        val current = book.value ?: return
+        val q = query.trim()
+        if (q.isEmpty()) {
+            _searchResults.value = emptyList()
+            return
+        }
+        viewModelScope.launch {
+            val rows = container.library.searchChapters(current.id, q)
+            _searchResults.value = rows.mapNotNull { row ->
+                val content = row.content ?: return@mapNotNull null
+                val at = content.indexOf(q)
+                if (at < 0) return@mapNotNull null
+                val start = (at - 30).coerceAtLeast(0)
+                val end = (at + q.length + 60).coerceAtMost(content.length)
+                SearchHit(
+                    chapterIndex = row.idx,
+                    chapterTitle = row.title,
+                    snippet = content.substring(start, end).replace('\n', ' '),
+                    query = q,
+                )
+            }
+        }
+    }
+
+    fun openSearchHit(hit: SearchHit) {
+        _pendingFind.value = hit.query
+        goTo(hit.chapterIndex)
+    }
+
+    fun consumePendingFind() {
+        _pendingFind.value = null
+    }
+
+    private fun refreshAnnotations() {
+        val current = book.value ?: return
+        viewModelScope.launch {
+            allAnnotations = container.annotations.annotations(current.id)
+            allBookmarks = container.annotations.bookmarks(current.id)
+            _annotations.value = allAnnotations.map {
+                AnnoItem(it.id, it.text, it.note, it.color, it.chapterIndex, it.chapterTitle)
+            }
+            _bookmarks.value = allBookmarks.map {
+                AnnoItem(
+                    id = it.id,
+                    text = it.excerpt ?: "",
+                    note = it.note,
+                    color = -1,
+                    chapterIndex = it.chapterIndex,
+                    chapterTitle = it.chapterTitle,
+                    ratio = it.ratio,
+                )
+            }
+            _annotationsJson.value = annotationsJsonFor(allAnnotations, _index.value)
+        }
+    }
+
+    private fun annotationsJsonFor(list: List<AnnotationEntity>, chapter: Int): String =
+        list.filter { it.chapterIndex == chapter }.joinToString(prefix = "[", postfix = "]") { a ->
+            "{\"id\":${jsonString(a.id)},\"sp\":${jsonString(a.startPath)},\"so\":${a.startOffset}," +
+                "\"ep\":${jsonString(a.endPath)},\"eo\":${a.endOffset},\"color\":${a.color}}"
+        }
+
+    private fun parseSelection(json: String): SelectionInfo? = runCatching {
+        val obj = Json.parseToJsonElement(json).jsonObject
+        SelectionInfo(
+            text = obj["text"]?.jsonPrimitive?.content ?: return null,
+            startPath = obj["sp"]?.jsonPrimitive?.content ?: return null,
+            startOffset = obj["so"]?.jsonPrimitive?.int ?: 0,
+            endPath = obj["ep"]?.jsonPrimitive?.content ?: return null,
+            endOffset = obj["eo"]?.jsonPrimitive?.int ?: 0,
+            xPx = obj["x"]?.jsonPrimitive?.float ?: 0f,
+            yPx = obj["y"]?.jsonPrimitive?.float ?: 0f,
+            heightPx = obj["h"]?.jsonPrimitive?.float ?: 0f,
+        )
+    }.getOrNull()
+
+    private fun jsonString(value: String): String = buildString {
+        append('"')
+        value.forEach { ch ->
+            when (ch) {
+                '\\' -> append("\\\\")
+                '"' -> append("\\\"")
+                '\n' -> append("\\n")
+                '\r' -> append("\\r")
+                '\t' -> append("\\t")
+                else -> if (ch < ' ') append("\\u%04x".format(ch.code)) else append(ch)
+            }
+        }
+        append('"')
+    }
+
     fun setWritingMode(mode: ReaderWritingMode) {
         viewModelScope.launch { container.settings.setWritingMode(mode) }
     }
@@ -357,6 +636,7 @@ class ReaderViewModel(
             _initialRatio.value = pendingRatio
             pendingRatio = -1f
             container.library.updateProgress(current.id, index, currentOffset)
+            refreshAnnotations()
 
             val stored = chapter.content
             val localPath = stored?.takeIf { it.isNotBlank() && File(it).exists() }
@@ -409,6 +689,13 @@ fun ReaderScreen(
     val message by viewModel.message.collectAsStateWithLifecycle()
     val initialOffset by viewModel.initialOffset.collectAsStateWithLifecycle()
     val initialRatio by viewModel.initialRatio.collectAsStateWithLifecycle()
+    val annotationsJson by viewModel.annotationsJson.collectAsStateWithLifecycle()
+    val annotations by viewModel.annotations.collectAsStateWithLifecycle()
+    val bookmarks by viewModel.bookmarks.collectAsStateWithLifecycle()
+    val selection by viewModel.selection.collectAsStateWithLifecycle()
+    val highlightTap by viewModel.highlightTap.collectAsStateWithLifecycle()
+    val pendingFind by viewModel.pendingFind.collectAsStateWithLifecycle()
+    val searchResults by viewModel.searchResults.collectAsStateWithLifecycle()
 
     var showToc by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
@@ -417,6 +704,12 @@ fun ReaderScreen(
     val snackbarHostState = remember { SnackbarHostState() }
     val turnController = remember { ReaderTurnController() }
     var chromeVisible by remember { mutableStateOf(true) }
+    var showAnnotations by remember { mutableStateOf(false) }
+    var showSearch by remember { mutableStateOf(false) }
+    var noteDraft by remember { mutableStateOf<String?>(null) }
+    var noteEditing by remember { mutableStateOf<AnnoItem?>(null) }
+    var searchQuery by remember { mutableStateOf("") }
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
 
     LaunchedEffect(message) {
         message?.let {
@@ -517,6 +810,15 @@ fun ReaderScreen(
                 },
                 actions = {
                     if (!isPdf && chapters.isNotEmpty()) {
+                        IconButton(onClick = { showSearch = true }) {
+                            Icon(Icons.Outlined.Search, contentDescription = "搜索")
+                        }
+                        IconButton(onClick = { viewModel.addBookmark() }) {
+                            Icon(Icons.Outlined.BookmarkAdd, contentDescription = "添加书签")
+                        }
+                        IconButton(onClick = { showAnnotations = true }) {
+                            Icon(Icons.Outlined.StickyNote2, contentDescription = "批注与书签")
+                        }
                         IconButton(onClick = { showToc = true }) {
                             Icon(Icons.AutoMirrored.Outlined.List, contentDescription = "目录")
                         }
@@ -615,8 +917,17 @@ fun ReaderScreen(
                         initialOffset = initialOffset,
                         initialRatio = initialRatio,
                         turnController = turnController,
+                        annotationsJson = annotationsJson,
+                        pendingFind = pendingFind,
+                        onSelectionJson = viewModel::onSelectionJson,
+                        onSelectionCleared = viewModel::onSelectionCleared,
+                        onHighlightTap = viewModel::onHighlightTapped,
+                        onFindConsumed = viewModel::consumePendingFind,
                         onPosition = viewModel::onPosition,
-                        onPageChanged = { page, pages -> pageInfo = page to pages },
+                        onPageChanged = { page, pages ->
+                            pageInfo = page to pages
+                            viewModel.onPageChanged(page, pages)
+                        },
                         onEdgeTurn = { forward ->
                             if (forward) viewModel.next() else viewModel.previous()
                         },
@@ -657,6 +968,130 @@ fun ReaderScreen(
                     )
                 }
             }
+        }
+    }
+
+    // 选中文字后的浮动工具条
+    selection?.let { sel ->
+        val density = LocalDensity.current
+        SelectionToolbar(
+            xDp = with(density) { sel.xPx.toDp() },
+            yDp = with(density) { sel.yPx.toDp() },
+            heightDp = with(density) { sel.heightPx.toDp() },
+            onColor = { color -> viewModel.addHighlight(color) },
+            onNote = { noteEditing = null; noteDraft = "" },
+            onCopy = {
+                clipboard.setText(AnnotatedString(sel.text))
+                viewModel.onSelectionCleared()
+            },
+            onSearch = {
+                searchQuery = sel.text.take(40)
+                viewModel.search(searchQuery)
+                showSearch = true
+                viewModel.onSelectionCleared()
+            },
+        )
+    }
+
+    // 点中已有高亮
+    highlightTap?.let { id ->
+        val item = annotations.firstOrNull { it.id == id }
+        if (item != null) {
+            AlertDialog(
+                onDismissRequest = viewModel::dismissHighlightTap,
+                title = { Text(if (item.note.isNullOrBlank()) "高亮" else "笔记") },
+                text = {
+                    Column {
+                        Text(item.text, style = MaterialTheme.typography.bodyMedium)
+                        if (!item.note.isNullOrBlank()) {
+                            Text(
+                                text = item.note,
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.padding(top = 8.dp),
+                            )
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        noteEditing = item
+                        noteDraft = item.note ?: ""
+                        viewModel.dismissHighlightTap()
+                    }) { Text("编辑笔记") }
+                },
+                dismissButton = {
+                    Row {
+                        TextButton(onClick = { viewModel.deleteAnnotation(id) }) { Text("删除") }
+                        TextButton(onClick = viewModel::dismissHighlightTap) { Text("关闭") }
+                    }
+                },
+            )
+        }
+    }
+
+    // 新建/编辑笔记
+    noteDraft?.let { draft ->
+        AlertDialog(
+            onDismissRequest = { noteDraft = null; noteEditing = null },
+            title = { Text(if (noteEditing == null) "添加笔记" else "编辑笔记") },
+            text = {
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = { noteDraft = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 3,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val editing = noteEditing
+                    if (editing != null) {
+                        viewModel.updateAnnotation(editing.id, draft.ifBlank { null }, editing.color)
+                    } else {
+                        viewModel.addHighlight(0, draft.ifBlank { null })
+                    }
+                    noteDraft = null
+                    noteEditing = null
+                }) { Text("保存") }
+            },
+            dismissButton = {
+                TextButton(onClick = { noteDraft = null; noteEditing = null }) { Text("取消") }
+            },
+        )
+    }
+
+    if (showAnnotations) {
+        ModalBottomSheet(onDismissRequest = { showAnnotations = false }) {
+            AnnotationsSheet(
+                annotations = annotations,
+                bookmarks = bookmarks,
+                onJump = { chapter ->
+                    showAnnotations = false
+                    viewModel.goTo(chapter)
+                },
+                onEditNote = { item ->
+                    showAnnotations = false
+                    noteEditing = item
+                    noteDraft = item.note ?: ""
+                },
+                onDeleteAnnotation = viewModel::deleteAnnotation,
+                onDeleteBookmark = viewModel::deleteBookmark,
+            )
+        }
+    }
+
+    if (showSearch) {
+        ModalBottomSheet(onDismissRequest = { showSearch = false }) {
+            SearchSheet(
+                query = searchQuery,
+                onQueryChange = { searchQuery = it },
+                onSearch = { viewModel.search(it) },
+                results = searchResults,
+                onOpen = { hit ->
+                    showSearch = false
+                    viewModel.openSearchHit(hit)
+                },
+            )
         }
     }
 
@@ -785,6 +1220,174 @@ fun ReaderScreen(
                     label = { it.label },
                     onSelect = viewModel::setTheme,
                 )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SelectionToolbar(
+    xDp: androidx.compose.ui.unit.Dp,
+    yDp: androidx.compose.ui.unit.Dp,
+    heightDp: androidx.compose.ui.unit.Dp,
+    onColor: (Int) -> Unit,
+    onNote: () -> Unit,
+    onCopy: () -> Unit,
+    onSearch: () -> Unit,
+) {
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val x = xDp.coerceIn(0.dp, (maxWidth - 300.dp).coerceAtLeast(0.dp))
+        val y = (yDp + heightDp + 8.dp).coerceIn(0.dp, (maxHeight - 60.dp).coerceAtLeast(0.dp))
+        Surface(
+            shape = androidx.compose.foundation.shape.RoundedCornerShape(26.dp),
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 6.dp,
+            shadowElevation = 8.dp,
+            modifier = Modifier
+                .offset(x = x, y = y)
+                .wrapContentSize(),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+            ) {
+                HIGHLIGHT_COLORS.forEachIndexed { index, hex ->
+                    Box(
+                        modifier = Modifier
+                            .padding(horizontal = 4.dp)
+                            .size(24.dp)
+                            .clip(androidx.compose.foundation.shape.CircleShape)
+                            .background(Color(android.graphics.Color.parseColor(hex)))
+                            .clickable { onColor(index) },
+                    )
+                }
+                IconButton(onClick = onNote) {
+                    Icon(Icons.Outlined.EditNote, contentDescription = "笔记")
+                }
+                IconButton(onClick = onCopy) {
+                    Icon(Icons.Outlined.ContentCopy, contentDescription = "复制")
+                }
+                IconButton(onClick = onSearch) {
+                    Icon(Icons.Outlined.Search, contentDescription = "在书中搜索")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AnnotationsSheet(
+    annotations: List<AnnoItem>,
+    bookmarks: List<AnnoItem>,
+    onJump: (Int) -> Unit,
+    onEditNote: (AnnoItem) -> Unit,
+    onDeleteAnnotation: (String) -> Unit,
+    onDeleteBookmark: (String) -> Unit,
+) {
+    var tab by remember { mutableStateOf(0) }
+    Column(modifier = Modifier.fillMaxWidth().fillMaxHeight(0.7f)) {
+        TabRow(selectedTabIndex = tab) {
+            Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("批注 ${annotations.size}") })
+            Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("书签 ${bookmarks.size}") })
+        }
+        val items = if (tab == 0) annotations else bookmarks
+        if (items.isEmpty()) {
+            Text(
+                text = if (tab == 0) "长按选中文字即可添加高亮或笔记" else "点顶栏的书签图标添加书签",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(24.dp),
+            )
+            return@Column
+        }
+        LazyColumn(modifier = Modifier.fillMaxWidth()) {
+            items(items, key = { it.id }) { item ->
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onJump(item.chapterIndex) }
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                ) {
+                    Text(
+                        text = item.chapterTitle.ifBlank { "第 ${item.chapterIndex + 1} 章" },
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        text = item.text,
+                        style = MaterialTheme.typography.bodyMedium,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(top = 2.dp),
+                    )
+                    if (!item.note.isNullOrBlank()) {
+                        Text(
+                            text = item.note,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
+                    }
+                    Row(modifier = Modifier.padding(top = 4.dp)) {
+                        if (tab == 0) {
+                            TextButton(onClick = { onEditNote(item) }) { Text("笔记") }
+                            TextButton(onClick = { onDeleteAnnotation(item.id) }) { Text("删除") }
+                        } else {
+                            TextButton(onClick = { onDeleteBookmark(item.id) }) { Text("删除") }
+                        }
+                    }
+                }
+                androidx.compose.material3.HorizontalDivider()
+            }
+        }
+    }
+}
+
+@Composable
+private fun SearchSheet(
+    query: String,
+    onQueryChange: (String) -> Unit,
+    onSearch: (String) -> Unit,
+    results: List<SearchHit>,
+    onOpen: (SearchHit) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .fillMaxHeight(0.7f)
+            .padding(horizontal = 16.dp),
+    ) {
+        OutlinedTextField(
+            value = query,
+            onValueChange = { onQueryChange(it); onSearch(it) },
+            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+            singleLine = true,
+            placeholder = { Text("在本书中搜索") },
+        )
+        Text(
+            text = if (results.isEmpty()) "输入关键字后自动搜索（只搜已缓存的章节正文）" else "共 ${results.size} 章命中",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(vertical = 8.dp),
+        )
+        LazyColumn(modifier = Modifier.fillMaxWidth()) {
+            items(results, key = { it.chapterIndex }) { hit ->
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onOpen(hit) }
+                        .padding(vertical = 8.dp),
+                ) {
+                    Text(hit.chapterTitle, style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        text = hit.snippet,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                androidx.compose.material3.HorizontalDivider()
             }
         }
     }
@@ -947,6 +1550,10 @@ internal fun cssFor(
     h1, h2, h3 { line-height: 1.45; margin: 1em 0 0.6em; }
     a { color: inherit; }
     pre { white-space: pre-wrap; }
+    ::highlight(tsu-hl-0) { background-color: rgba(255, 224, 130, ${s.highlightOpacity}); }
+    ::highlight(tsu-hl-1) { background-color: rgba(165, 214, 167, ${s.highlightOpacity}); }
+    ::highlight(tsu-hl-2) { background-color: rgba(144, 202, 249, ${s.highlightOpacity}); }
+    ::highlight(tsu-hl-3) { background-color: rgba(244, 143, 177, ${s.highlightOpacity}); }
 """.trimIndent()
 }
 @Suppress("UnusedReceiverParameter")
@@ -959,6 +1566,12 @@ private fun ChapterView(
     initialOffset: Int,
     initialRatio: Float,
     turnController: ReaderTurnController,
+    annotationsJson: String,
+    pendingFind: String?,
+    onSelectionJson: (String) -> Unit,
+    onSelectionCleared: () -> Unit,
+    onHighlightTap: (String) -> Unit,
+    onFindConsumed: () -> Unit,
     onPosition: (offset: Int, atEnd: Boolean) -> Unit,
     onPageChanged: (page: Int, pageCount: Int) -> Unit,
     onEdgeTurn: (forward: Boolean) -> Unit,
@@ -968,6 +1581,7 @@ private fun ChapterView(
     BoxWithConstraints(modifier = modifier) {
         val viewWidthPx = maxWidth.value.roundToInt().coerceAtLeast(1)
         val viewHeightPx = maxHeight.value.roundToInt().coerceAtLeast(1)
+        val density = LocalDensity.current.density
         val vertical = readerSettings.writingMode == ReaderWritingMode.VERTICAL
         // 竖排的栏轴与横排相反，暂不做多栏分页（滚动模式可用）
         val paged = readerSettings.layout == ReaderLayout.PAGED && !vertical
@@ -983,6 +1597,11 @@ private fun ChapterView(
         val pageCb = rememberUpdatedState(onPageChanged)
         val edgeCb = rememberUpdatedState(onEdgeTurn)
         val menuCb = rememberUpdatedState(onMenuTap)
+        val selectionCb = rememberUpdatedState(onSelectionJson)
+        val selectionClearedCb = rememberUpdatedState(onSelectionCleared)
+        val highlightTapCb = rememberUpdatedState(onHighlightTap)
+        val findConsumedCb = rememberUpdatedState(onFindConsumed)
+        val appliedHighlights = remember(localPath, html) { arrayOfNulls<String>(1) }
 
         // 翻页动画：把旧页截成位图盖在上面滑动/淡出（WebView 自己无法做翻页动画）
         var turnFx by remember { mutableStateOf<TurnSnapshot?>(null) }
@@ -1009,6 +1628,12 @@ private fun ChapterView(
                     turnFx = TurnSnapshot(snap, forward, style, web.width)
                 }
             }
+        }
+
+        LaunchedEffect(pendingFind) {
+            val query = pendingFind ?: return@LaunchedEffect
+            webRef?.findText(query)
+            findConsumedCb.value()
         }
 
         DisposableEffect(turnController) {
@@ -1092,6 +1717,9 @@ private fun ChapterView(
                     onPage = { page, pages -> pageCb.value(page, pages) }
                     onTapZone = { delta -> doTurn(delta > 0) }
                     this.onMenuTap = { menuCb.value.invoke() }
+                    this.onSelection = { json -> selectionCb.value(json) }
+                    this.onSelectionCleared = { selectionClearedCb.value() }
+                    this.onHighlightTap = { id -> highlightTapCb.value(id) }
                 }.also { webRef = it }
             },
             update = { web ->
@@ -1111,6 +1739,7 @@ private fun ChapterView(
                         tapZone = readerSettings.tapZone,
                         vwDp = viewWidthPx,
                         vhDp = viewHeightPx,
+                        density = density,
                     )
                     loadContent(
                         web = web,
@@ -1121,6 +1750,12 @@ private fun ChapterView(
                         viewWidthDp = viewWidthPx,
                         viewHeightDp = viewHeightPx,
                     )
+                    appliedHighlights[0] = null
+                }
+                // 批注变化时重新渲染高亮；文档刚载入时也补一次
+                if (appliedHighlights[0] != annotationsJson) {
+                    appliedHighlights[0] = annotationsJson
+                    web.applyHighlights(annotationsJson)
                 }
             },
         )
@@ -1163,8 +1798,19 @@ private class ReaderTurnController {
     var turn: ((forward: Boolean) -> Unit)? = null
 }
 
-/** 把正文塞进 WebView（EPUB 用本地文件，网页/TXT 用内存 HTML），并注入分页脚本。 */
-private fun loadContent(
+/** 把任意文本编码成单引号 JS 字符串字面量。 */
+private fun jsStringLiteral(value: String): String {
+    val escaped = value
+        .replace("\\", "\\\\")
+        .replace("'", "\\'")
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    return "'" + escaped + "'"
+}
+
+/** 把正文塞进 WebView（EPUB 用本地文件，网页/TXT 用内存 HTML），并注入分页脚本。 */private fun loadContent(
     web: WebView,
     html: String?,
     localPath: String?,
@@ -1237,6 +1883,9 @@ private class ReaderWebView(context: android.content.Context) : WebView(context)
     var onPage: ((page: Int, pageCount: Int) -> Unit)? = null
     var onTapZone: ((delta: Int) -> Unit)? = null
     var onMenuTap: (() -> Unit)? = null
+    var onSelection: ((json: String) -> Unit)? = null
+    var onSelectionCleared: (() -> Unit)? = null
+    var onHighlightTap: ((id: String) -> Unit)? = null
 
     private var jsActive = false
     private var restoreApplied = false
@@ -1254,6 +1903,9 @@ private class ReaderWebView(context: android.content.Context) : WebView(context)
         },
         onTap = { delta -> post { onTapZone?.invoke(delta) } },
         onMenu = { post { onMenuTap?.invoke() } },
+        onSelection = { json -> post { onSelection?.invoke(json) } },
+        onSelectionCleared = { post { onSelectionCleared?.invoke() } },
+        onHighlightTap = { id -> post { onHighlightTap?.invoke(id) } },
         onDebug = { message -> android.util.Log.d("TSUNDOKU_JS", message) },
     )
 
@@ -1329,8 +1981,21 @@ private class ReaderWebView(context: android.content.Context) : WebView(context)
         onResult(fallbackTurn(forward))
     }
 
-    /** 把当前页截成位图，供翻页动画使用。 */
-    fun snapshot(): android.graphics.Bitmap? = runCatching {
+    /** 注入当前章节的批注并渲染高亮。 */
+    fun applyHighlights(json: String) {
+        evaluateJavascript("window.__tsu&&window.__tsu.highlights(" + jsStringLiteral(json) + ")", null)
+    }
+
+    /** 定位到某段文字（全书搜索跳转）。 */
+    fun findText(text: String) {
+        evaluateJavascript("window.__tsu&&window.__tsu.find(" + jsStringLiteral(text) + ")", null)
+    }
+
+    fun clearSelection() {
+        evaluateJavascript("window.__tsu&&window.__tsu.clearSelection()", null)
+    }
+
+    /** 把当前页截成位图，供翻页动画使用。 */    fun snapshot(): android.graphics.Bitmap? = runCatching {
         if (width <= 0 || height <= 0) return null
         val bitmap = android.graphics.Bitmap.createBitmap(
             width,

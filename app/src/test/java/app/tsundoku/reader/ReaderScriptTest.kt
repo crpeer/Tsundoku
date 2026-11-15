@@ -20,6 +20,7 @@ class ReaderScriptTest {
         tapZone = ReaderTapZone.DEFAULT,
         vwDp = 411,
         vhDp = 624,
+        density = 1.75f,
     )
 
     @Test
@@ -31,6 +32,7 @@ class ReaderScriptTest {
         assertTrue(paged.contains("var PAD = 20"))
         assertTrue(paged.contains("var CFG_VW = 411"))
         assertTrue(paged.contains("var CFG_VH = 624"))
+        assertTrue(paged.contains("var DPR = 1.750"))
         assertTrue(paged.contains("var ZONE = 'default'"))
     }
 
@@ -42,6 +44,7 @@ class ReaderScriptTest {
             tapZone = ReaderTapZone.EDGE,
             vwDp = 411,
             vhDp = 624,
+            density = 1.75f,
         )
         assertTrue(scroll.contains("var PAGED = false"))
         assertTrue(scroll.contains("var ZONE = 'edge'"))

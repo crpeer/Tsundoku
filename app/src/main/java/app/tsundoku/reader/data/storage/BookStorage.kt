@@ -22,6 +22,7 @@ data class BookMeta(
     val updatedAt: Long = 0,
     val progress: ProgressMeta = ProgressMeta(),
     val annotations: List<AnnotationMeta> = emptyList(),
+    val bookmarks: List<BookmarkMeta> = emptyList(),
 )
 
 @Serializable
@@ -35,7 +36,17 @@ data class ProgressMeta(
     val positionOffset: Int = 0,
 )
 
-/** 批注占位结构：等阅读器选区功能落地后直接写入。 */
+@Serializable
+data class BookmarkMeta(
+    val chapterIndex: Int,
+    val chapterTitle: String? = null,
+    val offset: Int = 0,
+    val ratio: Float = 0f,
+    val excerpt: String? = null,
+    val note: String? = null,
+    val createdAt: Long = 0,
+)
+
 @Serializable
 data class AnnotationMeta(
     val chapterIndex: Int,
@@ -92,7 +103,13 @@ class BookStorage(private val context: Context) {
         return dir?.let { File(it, if (inBookDir) "meta.json" else "${book.id}.json") }
     }
 
-    fun writeMeta(book: Book, chapters: List<Chapter>, inBookDir: Boolean): File? {
+    fun writeMeta(
+        book: Book,
+        chapters: List<Chapter>,
+        inBookDir: Boolean,
+        annotations: List<AnnotationMeta> = emptyList(),
+        bookmarks: List<BookmarkMeta> = emptyList(),
+    ): File? {
         val target = metaFile(book, inBookDir) ?: return null
         val meta = BookMeta(
             id = book.id,
@@ -109,7 +126,8 @@ class BookStorage(private val context: Context) {
                 lastReadAt = book.lastReadAt ?: 0,
                 positionOffset = book.lastPositionOffset,
             ),
-            annotations = readAnnotations(book.id),
+            annotations = annotations,
+            bookmarks = bookmarks,
         )
         return runCatching {
             target.parentFile?.mkdirs()
@@ -144,7 +162,6 @@ class BookStorage(private val context: Context) {
     }.getOrNull()
 
     /** 后续接批注功能时改这里。 */
-    private fun readAnnotations(bookId: Long): List<AnnotationMeta> = emptyList()
 
     private fun scaleDown(bitmap: Bitmap, maxSide: Int): Bitmap {
         val longest = maxOf(bitmap.width, bitmap.height)

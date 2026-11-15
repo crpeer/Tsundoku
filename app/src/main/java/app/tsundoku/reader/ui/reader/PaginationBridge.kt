@@ -13,6 +13,9 @@ internal class PaginationBridge(
     private val onState: (page: Int, pages: Int, ratio: Float, atEnd: Boolean) -> Unit,
     private val onTap: (delta: Int) -> Unit,
     private val onMenu: () -> Unit,
+    private val onSelection: (String) -> Unit = {},
+    private val onSelectionCleared: () -> Unit = {},
+    private val onHighlightTap: (String) -> Unit = {},
     private val onDebug: (String) -> Unit = {},
 ) {
 
@@ -28,6 +31,15 @@ internal class PaginationBridge(
 
     @JavascriptInterface
     fun menu() = onMenu()
+
+    @JavascriptInterface
+    fun selection(json: String) = onSelection(json)
+
+    @JavascriptInterface
+    fun selectionCleared() = onSelectionCleared()
+
+    @JavascriptInterface
+    fun highlightTap(id: String) = onHighlightTap(id)
 
     @JavascriptInterface
     fun debug(message: String) = onDebug(message)

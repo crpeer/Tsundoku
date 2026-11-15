@@ -35,6 +35,7 @@ internal object ReaderScript {
         tapZone: ReaderTapZone,
         vwDp: Int,
         vhDp: Int,
+        density: Float,
     ): String =
         TEMPLATE
             .replace("__PAGED__", if (paged) "true" else "false")
@@ -42,6 +43,7 @@ internal object ReaderScript {
             .replace("__ZONE__", quote(tapZone.key))
             .replace("__VW__", vwDp.coerceAtLeast(80).toString())
             .replace("__VH__", vhDp.coerceAtLeast(80).toString())
+            .replace("__DPR__", String.format(java.util.Locale.US, "%.3f", density))
 
     /** 运行时切换点击区域，不必重新加载正文。 */
     fun setZoneCall(tapZone: ReaderTapZone): String =
@@ -69,6 +71,8 @@ internal object ReaderScript {
 
   var CFG_VW = __VW__;
   var CFG_VH = __VH__;
+  var DPR = __DPR__;
+  var annotations = [];
 
   /** 视口尺寸固定用 Kotlin 侧量到的值，见 build() 的注释。 */
   function vw() { return CFG_VW; }
@@ -155,6 +159,133 @@ internal object ReaderScript {
     return Math.max(0, Math.min(i, pages - 1));
   }
 
+  // ---------- 批注：选区、序列化、渲染、命中 ----------
+
+  /** 文本节点 → 相对 body 的路径（第 n 个子节点的 n/n/n 形式）。 */
+  function pathOf(node) {
+    var parts = [];
+    var n = node;
+    while (n && n.parentNode && n !== document.body) {
+      var idx = 0;
+      var sib = n;
+      while ((sib = sib.previousSibling)) idx++;
+      parts.unshift(idx);
+      n = n.parentNode;
+    }
+    return parts.join('/');
+  }
+
+  function nodeAt(path) {
+    var n = document.body;
+    if (!path) return n;
+    var parts = String(path).split('/');
+    for (var i = 0; i < parts.length; i++) {
+      var idx = parseInt(parts[i], 10);
+      if (isNaN(idx) || !n || !n.childNodes || !n.childNodes[idx]) return null;
+      n = n.childNodes[idx];
+    }
+    return n;
+  }
+
+  function rangeOf(a) {
+    var sn = nodeAt(a.sp);
+    var en = nodeAt(a.ep);
+    if (!sn || !en) return null;
+    try {
+      var r = document.createRange();
+      r.setStart(sn, a.so);
+      r.setEnd(en, a.eo);
+      return r;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** 用 CSS Custom Highlight API 渲染高亮：不改 DOM，所以路径永远有效。 */
+  function applyHighlights() {
+    if (!window.CSS || !CSS.highlights || typeof Highlight === 'undefined') return false;
+    for (var c = 0; c < 4; c++) {
+      try { CSS.highlights.delete('tsu-hl-' + c); } catch (e) {}
+    }
+    var groups = [[], [], [], []];
+    for (var i = 0; i < annotations.length; i++) {
+      var r = rangeOf(annotations[i]);
+      if (r) groups[Math.abs(annotations[i].color | 0) % 4].push(r);
+    }
+    for (var k = 0; k < 4; k++) {
+      if (!groups[k].length) continue;
+      try { CSS.highlights.set('tsu-hl-' + k, new Highlight(...groups[k])); } catch (e) {}
+    }
+    return true;
+  }
+
+  function reportSelection() {
+    if (!B) return;
+    var sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
+      try { B.selectionCleared(); } catch (e) {}
+      return;
+    }
+    var range = sel.getRangeAt(0);
+    var text = String(sel);
+    if (!text || !text.trim()) {
+      try { B.selectionCleared(); } catch (e) {}
+      return;
+    }
+    var rect = range.getBoundingClientRect();
+    var payload = {
+      text: text.length > 2000 ? text.slice(0, 2000) : text,
+      sp: pathOf(range.startContainer),
+      so: range.startOffset,
+      ep: pathOf(range.endContainer),
+      eo: range.endOffset,
+      x: (rect.left + rect.width / 2) * DPR,
+      y: rect.top * DPR,
+      h: rect.height * DPR
+    };
+    try { B.selection(JSON.stringify(payload)); } catch (e) {}
+  }
+
+  function highlightAt(x, y) {
+    if (!annotations.length) return null;
+    var probe = document.caretRangeFromPoint ? document.caretRangeFromPoint(x, y) : null;
+    if (!probe || !probe.startContainer) return null;
+    for (var i = 0; i < annotations.length; i++) {
+      var r = rangeOf(annotations[i]);
+      if (!r) continue;
+      try {
+        if (r.intersectsNode(probe.startContainer)) return annotations[i].id;
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  /** 全书搜索跳转：找到文字、选中它，并把视口滚过去。 */
+  function findAndScroll(text) {
+    if (!text) return 'false';
+    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+    var node = null;
+    var found = null;
+    while ((node = walker.nextNode())) {
+      var idx = node.nodeValue ? node.nodeValue.indexOf(text) : -1;
+      if (idx >= 0) { found = { n: node, i: idx }; break; }
+    }
+    if (!found) return 'false';
+    var r = document.createRange();
+    r.setStart(found.n, found.i);
+    r.setEnd(found.n, found.i + text.length);
+    var sel = window.getSelection();
+    if (sel) { sel.removeAllRanges(); sel.addRange(r); }
+    var rect = r.getBoundingClientRect();
+    if (PAGED) {
+      var target = Math.max(0, pos() + rect.left - 20);
+      scrollToPos(Math.floor(target / Math.max(1, step)) * step);
+    } else {
+      window.scrollTo(0, Math.max(0, window.scrollY + rect.top - 80));
+    }
+    report();
+    return 'true';
+  }
   function state() {
     ensure();
     var p = Math.max(0, Math.min(pos(), maxScroll));
@@ -214,6 +345,11 @@ internal object ReaderScript {
     var t = e.target;
     if (t && t.closest && t.closest('a')) return;
     if (window.getSelection && String(window.getSelection()).length > 0) return;
+    var hit = highlightAt(e.clientX, e.clientY);
+    if (hit) {
+      if (B) { try { B.highlightTap(hit); } catch (err) {} }
+      return;
+    }
     var z = zone(e.clientX, e.clientY);
     if (z === 0) {
       if (B) { try { B.menu(); } catch (err) {} }
@@ -247,6 +383,16 @@ internal object ReaderScript {
     if (PAGED && e.touches.length === 1 && e.cancelable) e.preventDefault();
   }, { passive: false });
 
+  var selTimer = 0;
+  function scheduleSelection() {
+    if (selTimer) window.clearTimeout(selTimer);
+    selTimer = window.setTimeout(reportSelection, 160);
+  }
+  document.addEventListener('selectionchange', scheduleSelection);
+  document.addEventListener('touchend', function () {
+    window.setTimeout(reportSelection, 80);
+  }, { passive: true });
+
   window.addEventListener('scroll', report, { passive: true });
   window.addEventListener('resize', function () { measure(); report(); });
   window.addEventListener('load', function () { measure(); report(); });
@@ -279,6 +425,17 @@ internal object ReaderScript {
       ensure();
       scrollToPos((r || 0) * maxScroll);
       report();
+      return 'true';
+    },
+    highlights: function (json) {
+      try { annotations = JSON.parse(json || '[]') || []; } catch (e) { annotations = []; }
+      return applyHighlights() ? 'true' : 'false';
+    },
+    find: function (text) { return findAndScroll(text); },
+    clearSelection: function () {
+      var sel = window.getSelection();
+      if (sel) sel.removeAllRanges();
+      reportSelection();
       return 'true';
     },
     info: function () {
