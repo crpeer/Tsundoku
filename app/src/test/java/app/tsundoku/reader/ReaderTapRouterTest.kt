@@ -125,11 +125,19 @@ class ReaderTapRouterTest {
 
     @Test
     fun missingCaretPositionNeverOpensTheHighlightMenu() {
-        // 脚本拿不到 caret 时上报空路径 / -1：任何批注都不能被命中
+        // 脚本拿不到 caret 时传 offset = -1（唯一的无效标记）：任何批注都不能被命中
         assertTrue(route("", -1) !is TapResult.Highlight)
-        assertTrue(route("", 0) !is TapResult.Highlight)
         assertTrue(route("0/0", -1) !is TapResult.Highlight)
         assertEquals(TapAction.MENU, action(route("", -1)))
+    }
+
+    @Test
+    fun bodyRootBoundaryIsAValidClickPosition() {
+        // 空路径表示 body 根节点，配合有效 offset 是合法落点（不能用空路径判断「取不到位置」）
+        val range = AnnotationRange("a5", startPath = "", startOffset = 1, endPath = "2/0", endOffset = 3, color = 0)
+
+        assertEquals("a5", highlightId(route("", 1, ranges = listOf(range))))
+        assertTrue(route("", -1, ranges = listOf(range)) !is TapResult.Highlight)
     }
 
     // ---------- 原有菜单 / 编辑 / 删除链路 ----------

@@ -152,7 +152,10 @@ internal object ReaderScript {
 
   // ---------- 批注：选区、序列化、渲染、命中 ----------
 
-  /** 文本节点 → 相对 body 的路径（第 n 个子节点的 n/n/n 形式）。 */
+  /**
+   * 节点 → 相对 body 的路径（第 n 个子节点的 n/n/n 形式），每一级都按 childNodes 计。
+   * 返回**空串表示 `document.body` 本身**：根节点也是合法的边界点，不能当作「无效」。
+   */
   function pathOf(node) {
     var parts = [];
     var n = node;
@@ -307,6 +310,7 @@ internal object ReaderScript {
       ? document.caretRangeFromPoint(e.clientX, e.clientY)
       : null;
     var node = caret && caret.startContainer ? caret.startContainer : null;
+    // 空路径本身表示 body 根节点，是合法位置；拿不到 caret 时用 offset = -1 作为无效标记
     var path = node ? pathOf(node) : '';
     var offset = caret ? caret.startOffset : -1;
     try {
