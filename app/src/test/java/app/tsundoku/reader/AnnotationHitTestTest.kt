@@ -89,12 +89,66 @@ class AnnotationHitTestTest {
     }
 
     @Test
-    fun invalidPathOrOffsetIsRejected() {
-        // 脚本在拿不到 caret 时会传空路径与 -1，必须当作「没点在高亮上」
-        assertNull(AnnotationHitTest.hit(listOf(partial), "", 4))
+    fun missingCaretOrMalformedPathIsRejected() {
+        // 拿不到 caret 时脚本传 offset = -1；路径格式非法时 parsePath 返回 null。两者都不算命中。
         assertNull(AnnotationHitTest.hit(listOf(partial), "0/1/0", -1))
+        assertNull(AnnotationHitTest.hit(listOf(partial), "", -1))
         assertNull(AnnotationHitTest.hit(listOf(partial), "0/a/0", 4))
         assertNull(AnnotationHitTest.hit(listOf(partial), "0//0", 4))
+    }
+
+    // ---------- body 根节点：空路径是合法边界，-1 才是「位置不可用」 ----------
+
+    @Test
+    fun emptyPathParsesToTheBodyRoot() {
+        assertEquals(emptyList<Int>(), AnnotationHitTest.parsePath(""))
+    }
+
+    @Test
+    fun bodyRootCanBeBothRangeStartAndEnd() {
+        // 范围 = 「body 的第 1 个子节点之前」到「body 的第 3 个子节点之前」
+        val whole = AnnotationRange("r1", startPath = "", startOffset = 1, endPath = "", endOffset = 3, color = 0)
+
+        // 起点包含、终点不包含
+        assertSame(whole, AnnotationHitTest.hit(listOf(whole), "", 1))
+        assertSame(whole, AnnotationHitTest.hit(listOf(whole), "", 2))
+        assertNull(AnnotationHitTest.hit(listOf(whole), "", 3))
+        assertNull(AnnotationHitTest.hit(listOf(whole), "", 0))
+
+        // 根节点作为祖先参与比较：范围内更深的节点要命中，范围外的不要
+        assertSame(whole, AnnotationHitTest.hit(listOf(whole), "1/0", 2))
+        assertNull(AnnotationHitTest.hit(listOf(whole), "3/0", 0))
+    }
+
+    @Test
+    fun bodyRootStartsTheRangeAndTextEndsIt() {
+        val range = AnnotationRange("r2", startPath = "", startOffset = 1, endPath = "2/0", endOffset = 3, color = 1)
+
+        assertSame(range, AnnotationHitTest.hit(listOf(range), "", 1))
+        assertSame(range, AnnotationHitTest.hit(listOf(range), "1/0", 0))
+        assertSame(range, AnnotationHitTest.hit(listOf(range), "2/0", 2))
+        assertNull(AnnotationHitTest.hit(listOf(range), "2/0", 3))
+        assertNull(AnnotationHitTest.hit(listOf(range), "", 0))
+    }
+
+    @Test
+    fun bodyRootAsEndStaysExclusive() {
+        val range = AnnotationRange("r3", startPath = "0/0", startOffset = 5, endPath = "", endOffset = 2, color = 2)
+
+        assertSame(range, AnnotationHitTest.hit(listOf(range), "0/0", 5))
+        assertSame(range, AnnotationHitTest.hit(listOf(range), "1/0", 0))
+        // body offset 2 =「第 2 个子节点之前」，正好是终点，不包含
+        assertNull(AnnotationHitTest.hit(listOf(range), "", 2))
+        assertNull(AnnotationHitTest.hit(listOf(range), "2/0", 0))
+    }
+
+    @Test
+    fun emptyPathWithMissingCaretOffsetNeverHits() {
+        // 哪怕范围整个覆盖根节点，offset = -1 也要判为「位置不可用」
+        val all = AnnotationRange("r4", startPath = "", startOffset = 0, endPath = "", endOffset = 99, color = 3)
+
+        assertNull(AnnotationHitTest.hit(listOf(all), "", -1))
+        assertSame(all, AnnotationHitTest.hit(listOf(all), "", 0))
     }
 
     @Test

@@ -31,11 +31,15 @@ object AnnotationHitTest {
 
     /**
      * @param ranges 当前章节的批注，顺序即优先级（重叠时取第一条）
-     * @param path 点击位置所在节点的路径（脚本 `pathOf()` 的结果，可能是 Text 也可能是 Element）
-     * @param offset 点击位置在该节点内的偏移：Text 是字符下标，Element 是子节点下标
+     * @param path 点击位置所在节点的路径（脚本 `pathOf()` 的结果，可能是 Text 也可能是 Element）；
+     *   **空串表示 `document.body` 本身**，也就是根节点边界，是合法位置
+     * @param offset 点击位置在该节点内的偏移：Text 是字符下标，Element 是子节点下标；
+     *   `< 0` 是脚本「拿不到 caret」的无效标记（`caretRangeFromPoint()` 失败时脚本传 -1），
+     *   用它来区分「位置不可用」与「合法的根节点边界」
      */
     fun hit(ranges: List<AnnotationRange>, path: String, offset: Int): AnnotationRange? {
-        if (ranges.isEmpty() || path.isEmpty() || offset < 0) return null
+        // path 允许为空：那表示 body 根节点；只有 offset < 0 这个哨兵代表位置不可用
+        if (ranges.isEmpty() || offset < 0) return null
         val point = parsePath(path) ?: return null
         for (range in ranges) {
             val start = parsePath(range.startPath) ?: continue
@@ -80,7 +84,11 @@ object AnnotationHitTest {
         return pOffset.compareTo(qOffset)
     }
 
-    /** 把 `"0/1/3"` 解析成下标数组；格式非法返回 null。 */
+    /**
+     * 把 `"0/1/3"` 解析成下标数组；格式非法返回 null。
+     *
+     * 空串解析成空数组 —— 即 `document.body` 根节点，与 `pathOf(document.body)` 的返回值一致。
+     */
     fun parsePath(path: String): List<Int>? {
         if (path.isEmpty()) return emptyList()
         val parts = path.split('/')

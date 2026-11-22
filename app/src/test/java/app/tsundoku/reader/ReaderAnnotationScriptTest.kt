@@ -1,7 +1,7 @@
 package app.tsundoku.reader
 
-import app.tsundoku.reader.data.prefs.ReaderTapZone
 import app.tsundoku.reader.ui.reader.ReaderScript
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -11,7 +11,6 @@ class ReaderAnnotationScriptTest {
     private val script = ReaderScript.build(
         paged = true,
         padPx = 20,
-        tapZone = ReaderTapZone.DEFAULT,
         vwDp = 411,
         vhDp = 624,
         density = 1.75f,
@@ -29,7 +28,6 @@ class ReaderAnnotationScriptTest {
         // 高亮用 CSS Custom Highlight API 渲染，不能改 DOM（否则保存的文本节点路径会失效）
         assertTrue(script.contains("CSS.highlights"))
         assertTrue(script.contains("new Highlight("))
-        assertTrue(script.contains("::highlight(tsu-hl-") || true)
     }
 
     @Test
@@ -41,9 +39,11 @@ class ReaderAnnotationScriptTest {
     }
 
     @Test
-    fun tapsOnHighlightsAreDetectedBeforePaging() {
-        val hitIndex = script.indexOf("highlightAt(e.clientX, e.clientY)")
-        val zoneIndex = script.indexOf("var z = zone(e.clientX, e.clientY);")
-        assertTrue(hitIndex in 0 until zoneIndex)
+    fun clickCarriesCaretPathAndOffsetForHitTesting() {
+        // 命中判定在 Kotlin 侧，脚本必须把落点的 (节点路径, 字符偏移) 一起传上来
+        assertTrue(script.contains("document.caretRangeFromPoint"))
+        assertTrue(script.contains("pathOf(node)"))
+        assertTrue(script.contains("var offset = caret ? caret.startOffset : -1"))
+        assertFalse(script.contains("intersectsNode"))
     }
 }
