@@ -1,7 +1,5 @@
 package app.tsundoku.reader.ui.reader
 
-import app.tsundoku.reader.data.prefs.ReaderTapZone
-
 /**
  * 阅读器内嵌脚本：**CSS 多栏分页**（与 Readest / foliate-js 同一思路）。
  *
@@ -17,8 +15,11 @@ import app.tsundoku.reader.data.prefs.ReaderTapZone
  * 用多栏而不是「按视口高度滚动」，是因为多栏在布局阶段就不会把行盒切到两栏里，
  * 天然没有半行残字。
  *
- * 脚本只改自己的 DOM 样式、只调用 `TsundokuBridge` 上那几个整数参数的方法，不碰文件与网络；
- * 加载前会把 EPUB 自带的 `<script>` 与内联事件属性清掉。
+ * 脚本只改自己的 DOM 样式、只通过 `TsundokuBridge` 上报状态（页码、选区、点击点），
+ * 不碰文件与网络；加载前会把 EPUB 自带的 `<script>` 与内联事件属性清掉。
+ *
+ * 点击区域与高亮命中的**判定**不在这里：脚本把 (坐标, 文本节点路径, 字符偏移) 交给 Kotlin，
+ * 由 `ReaderTapZoneMath` / `AnnotationHitTest` 决定行为，那两处可以写真正的单元测试。
  */
 internal object ReaderScript {
 
@@ -32,7 +33,6 @@ internal object ReaderScript {
     fun build(
         paged: Boolean,
         padPx: Int,
-        tapZone: ReaderTapZone,
         vwDp: Int,
         vhDp: Int,
         density: Float,
@@ -40,24 +40,15 @@ internal object ReaderScript {
         TEMPLATE
             .replace("__PAGED__", if (paged) "true" else "false")
             .replace("__PAD__", padPx.coerceIn(0, 80).toString())
-            .replace("__ZONE__", quote(tapZone.key))
             .replace("__VW__", vwDp.coerceAtLeast(80).toString())
             .replace("__VH__", vhDp.coerceAtLeast(80).toString())
             .replace("__DPR__", String.format(java.util.Locale.US, "%.3f", density))
-
-    /** 运行时切换点击区域，不必重新加载正文。 */
-    fun setZoneCall(tapZone: ReaderTapZone): String =
-        "window.__tsu&&window.__tsu.setZone(" + quote(tapZone.key) + ")"
-
-    private fun quote(value: String): String =
-        "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
     private val TEMPLATE = """
 (function () {
   var B = window.TsundokuBridge || null;
   var PAGED = __PAGED__;
   var PAD = __PAD__;
-  var ZONE = __ZONE__;
   if (window.__tsu) { try { window.__tsu.remount(); } catch (e) {} return; }
   if (window.__tsuLoaded) return;
   window.__tsuLoaded = true;
@@ -246,20 +237,6 @@ internal object ReaderScript {
     try { B.selection(JSON.stringify(payload)); } catch (e) {}
   }
 
-  function highlightAt(x, y) {
-    if (!annotations.length) return null;
-    var probe = document.caretRangeFromPoint ? document.caretRangeFromPoint(x, y) : null;
-    if (!probe || !probe.startContainer) return null;
-    for (var i = 0; i < annotations.length; i++) {
-      var r = rangeOf(annotations[i]);
-      if (!r) continue;
-      try {
-        if (r.intersectsNode(probe.startContainer)) return annotations[i].id;
-      } catch (e) {}
-    }
-    return null;
-  }
-
   /** 全书搜索跳转：找到文字、选中它，并把视口滚过去。 */
   function findAndScroll(text) {
     if (!text) return 'false';
@@ -308,54 +285,33 @@ internal object ReaderScript {
     });
   }
 
-  function zone(x, y) {
-    var w = window.innerWidth;
-    var h = window.innerHeight;
-    if (ZONE === 'disabled') return 0;
-    var left = x;
-    var right = w - x;
-    if (ZONE === 'rightleft') return x < w / 2 ? -1 : 1;
-    if (ZONE === 'edge') {
-      if (left < w * 0.2) return -1;
-      if (right < w * 0.2) return 1;
-      return 0;
-    }
-    if (ZONE === 'kindle') {
-      if (left < w * 0.25) return -1;
-      if (right < w * 0.25) return 1;
-      return 0;
-    }
-    if (ZONE === 'lshape') {
-      if (y > h * 0.85) return x < w / 2 ? -1 : 1;
-      if (left < w / 3) return -1;
-      if (right < w / 3) return 1;
-      return 0;
-    }
-    if (left < w / 3) return -1;
-    if (right < w / 3) return 1;
-    return 0;
-  }
-
+  /** 左右滑动翻页（点区域判定在 Kotlin 侧，滑动方向是明确的，不需要判定）。 */
   function send(delta) {
     if (!B) return;
     try { B.tap(delta); } catch (e) {}
   }
 
+  /**
+   * 点击正文：把「点击坐标 + 落点所在的文本节点与字符偏移」交给 Kotlin。
+   *
+   * 命中高亮与点击区域都在 Kotlin 侧判定（`AnnotationHitTest` / `ReaderTapZoneMath`），
+   * 这样判定逻辑可以被单元测试覆盖；脚本只负责测量与上报。
+   * 注意不能先算区域再上报，否则「点击区域被禁用」就会退回成「中间区域」。
+   */
   document.addEventListener('click', function (e) {
     var t = e.target;
     if (t && t.closest && t.closest('a')) return;
     if (window.getSelection && String(window.getSelection()).length > 0) return;
-    var hit = highlightAt(e.clientX, e.clientY);
-    if (hit) {
-      if (B) { try { B.highlightTap(hit); } catch (err) {} }
-      return;
-    }
-    var z = zone(e.clientX, e.clientY);
-    if (z === 0) {
-      if (B) { try { B.menu(); } catch (err) {} }
-      return;
-    }
-    if (PAGED) send(z > 0 ? 1 : -1);
+    if (!B || !B.point) return;
+    var caret = document.caretRangeFromPoint
+      ? document.caretRangeFromPoint(e.clientX, e.clientY)
+      : null;
+    var node = caret && caret.startContainer ? caret.startContainer : null;
+    var path = node ? pathOf(node) : '';
+    var offset = caret ? caret.startOffset : -1;
+    try {
+      B.point(e.clientX, e.clientY, path, offset);
+    } catch (err) {}
   }, true);
 
   var sx = 0, sy = 0, st = 0, tracking = false;
@@ -402,7 +358,6 @@ internal object ReaderScript {
 
   window.__tsu = {
     remount: function () { measure(); report(); },
-    setZone: function (z) { ZONE = z; },
     measure: measure,
     ensure: ensure,
     turn: function (d) {
@@ -423,7 +378,13 @@ internal object ReaderScript {
     },
     ratio: function (r) {
       ensure();
-      scrollToPos((r || 0) * maxScroll);
+      var target = (r || 0) * maxScroll;
+      // 翻页模式必须落在页边界上：重排后按比例算出的偏移通常在两列之间，
+      // 直接滚过去会同时露出上一列的后半行和下一列的前半行（半列残字）。
+      if (PAGED && step > 0) {
+        target = Math.round(target / step) * step;
+      }
+      scrollToPos(target);
       report();
       return 'true';
     },

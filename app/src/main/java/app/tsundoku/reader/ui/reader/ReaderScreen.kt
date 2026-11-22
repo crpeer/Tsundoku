@@ -165,6 +165,9 @@ data class SearchHit(
     val query: String,
 )
 
+/** 全书搜索跳转后要在正文里定位的请求；[id] 保证同一个关键字重复搜索也能再次触发。 */
+data class FindRequest(val id: Long, val text: String)
+
 sealed interface ChapterContent {
     data object Loading : ChapterContent
     data class Ready(val html: String?, val localPath: String?) : ChapterContent
@@ -203,9 +206,9 @@ class ReaderViewModel(
     private val _initialRatio = MutableStateFlow(-1f)
     val initialRatio: StateFlow<Float> = _initialRatio.asStateFlow()
 
-    /** 本书当前章节的批注（JSON，交给脚本渲染高亮）。 */
-    private val _annotationsJson = MutableStateFlow("[]")
-    val annotationsJson: StateFlow<String> = _annotationsJson.asStateFlow()
+    /** 当前章节的批注范围（渲染高亮 + 点击命中判定共用这一份数据）。 */
+    private val _annotationRanges = MutableStateFlow<List<AnnotationRange>>(emptyList())
+    val annotationRanges: StateFlow<List<AnnotationRange>> = _annotationRanges.asStateFlow()
 
     private val _annotations = MutableStateFlow<List<AnnoItem>>(emptyList())
     val annotations: StateFlow<List<AnnoItem>> = _annotations.asStateFlow()
@@ -220,9 +223,10 @@ class ReaderViewModel(
     private val _highlightTap = MutableStateFlow<String?>(null)
     val highlightTap: StateFlow<String?> = _highlightTap.asStateFlow()
 
-    /** 搜索结果跳转后要在正文里定位的文字。 */
-    private val _pendingFind = MutableStateFlow<String?>(null)
-    val pendingFind: StateFlow<String?> = _pendingFind.asStateFlow()
+    /** 搜索结果跳转后要在正文里定位的文字。带自增 id，所以同一关键字跨章搜索也会重新触发。 */
+    private val _findRequest = MutableStateFlow<FindRequest?>(null)
+    val findRequest: StateFlow<FindRequest?> = _findRequest.asStateFlow()
+    private var findSeq = 0L
 
     private val _searchResults = MutableStateFlow<List<SearchHit>>(emptyList())
     val searchResults: StateFlow<List<SearchHit>> = _searchResults.asStateFlow()
@@ -540,12 +544,13 @@ class ReaderViewModel(
     }
 
     fun openSearchHit(hit: SearchHit) {
-        _pendingFind.value = hit.query
+        findSeq += 1
+        _findRequest.value = FindRequest(findSeq, hit.query)
         goTo(hit.chapterIndex)
     }
 
     fun consumePendingFind() {
-        _pendingFind.value = null
+        _findRequest.value = null
     }
 
     private fun refreshAnnotations() {
@@ -567,14 +572,21 @@ class ReaderViewModel(
                     ratio = it.ratio,
                 )
             }
-            _annotationsJson.value = annotationsJsonFor(allAnnotations, _index.value)
+            _annotationRanges.value = rangesFor(allAnnotations, _index.value)
         }
     }
 
-    private fun annotationsJsonFor(list: List<AnnotationEntity>, chapter: Int): String =
-        list.filter { it.chapterIndex == chapter }.joinToString(prefix = "[", postfix = "]") { a ->
-            "{\"id\":${jsonString(a.id)},\"sp\":${jsonString(a.startPath)},\"so\":${a.startOffset}," +
-                "\"ep\":${jsonString(a.endPath)},\"eo\":${a.endOffset},\"color\":${a.color}}"
+    /** 当前章节的批注范围：渲染高亮与点击命中判定共用同一份数据。 */
+    private fun rangesFor(list: List<AnnotationEntity>, chapter: Int): List<AnnotationRange> =
+        list.filter { it.chapterIndex == chapter }.map {
+            AnnotationRange(
+                id = it.id,
+                startPath = it.startPath,
+                startOffset = it.startOffset,
+                endPath = it.endPath,
+                endOffset = it.endOffset,
+                color = it.color,
+            )
         }
 
     private fun parseSelection(json: String): SelectionInfo? = runCatching {
@@ -591,20 +603,7 @@ class ReaderViewModel(
         )
     }.getOrNull()
 
-    private fun jsonString(value: String): String = buildString {
-        append('"')
-        value.forEach { ch ->
-            when (ch) {
-                '\\' -> append("\\\\")
-                '"' -> append("\\\"")
-                '\n' -> append("\\n")
-                '\r' -> append("\\r")
-                '\t' -> append("\\t")
-                else -> if (ch < ' ') append("\\u%04x".format(ch.code)) else append(ch)
-            }
-        }
-        append('"')
-    }
+
 
     fun setWritingMode(mode: ReaderWritingMode) {
         viewModelScope.launch { container.settings.setWritingMode(mode) }
@@ -689,12 +688,12 @@ fun ReaderScreen(
     val message by viewModel.message.collectAsStateWithLifecycle()
     val initialOffset by viewModel.initialOffset.collectAsStateWithLifecycle()
     val initialRatio by viewModel.initialRatio.collectAsStateWithLifecycle()
-    val annotationsJson by viewModel.annotationsJson.collectAsStateWithLifecycle()
+    val annotationRanges by viewModel.annotationRanges.collectAsStateWithLifecycle()
     val annotations by viewModel.annotations.collectAsStateWithLifecycle()
     val bookmarks by viewModel.bookmarks.collectAsStateWithLifecycle()
     val selection by viewModel.selection.collectAsStateWithLifecycle()
     val highlightTap by viewModel.highlightTap.collectAsStateWithLifecycle()
-    val pendingFind by viewModel.pendingFind.collectAsStateWithLifecycle()
+    val findRequest by viewModel.findRequest.collectAsStateWithLifecycle()
     val searchResults by viewModel.searchResults.collectAsStateWithLifecycle()
 
     var showToc by remember { mutableStateOf(false) }
@@ -917,8 +916,8 @@ fun ReaderScreen(
                         initialOffset = initialOffset,
                         initialRatio = initialRatio,
                         turnController = turnController,
-                        annotationsJson = annotationsJson,
-                        pendingFind = pendingFind,
+                        annotationRanges = annotationRanges,
+                        findRequest = findRequest,
                         onSelectionJson = viewModel::onSelectionJson,
                         onSelectionCleared = viewModel::onSelectionCleared,
                         onHighlightTap = viewModel::onHighlightTapped,
@@ -1566,8 +1565,8 @@ private fun ChapterView(
     initialOffset: Int,
     initialRatio: Float,
     turnController: ReaderTurnController,
-    annotationsJson: String,
-    pendingFind: String?,
+    annotationRanges: List<AnnotationRange>,
+    findRequest: FindRequest?,
     onSelectionJson: (String) -> Unit,
     onSelectionCleared: () -> Unit,
     onHighlightTap: (String) -> Unit,
@@ -1630,9 +1629,15 @@ private fun ChapterView(
             }
         }
 
-        LaunchedEffect(pendingFind) {
-            val query = pendingFind ?: return@LaunchedEffect
-            webRef?.findText(query)
+        // 搜索定位请求的投递由 update 块负责（那里才一定拿得到 WebView 实例）。
+        // 同一个 id 只投递一次；WebView 内部还会排队，等脚本就绪后才真正执行。
+        val deliveredFind = remember(localPath, html) { longArrayOf(-1L) }
+
+        fun deliverFind(web: ReaderWebView) {
+            val request = findRequest ?: return
+            if (deliveredFind[0] == request.id) return
+            deliveredFind[0] = request.id
+            web.requestFind(request.text)
             findConsumedCb.value()
         }
 
@@ -1665,7 +1670,6 @@ private fun ChapterView(
                 readerSettings.letterSpacing,
                 readerSettings.wordSpacing,
                 readerSettings.justify,
-                readerSettings.tapZone.key,
                 viewWidthPx,
                 viewHeightPx,
             ).joinToString("|")
@@ -1736,7 +1740,6 @@ private fun ChapterView(
                     val script = ReaderScript.build(
                         paged = paged,
                         padPx = readerSettings.horizontalPadding,
-                        tapZone = readerSettings.tapZone,
                         vwDp = viewWidthPx,
                         vhDp = viewHeightPx,
                         density = density,
@@ -1752,11 +1755,17 @@ private fun ChapterView(
                     )
                     appliedHighlights[0] = null
                 }
+                // 点击区域与视口尺寸：判定在 Kotlin 侧做，改了设置不必重排正文
+                web.tapZone = readerSettings.tapZone
+                web.cssWidth = viewWidthPx
+                web.cssHeight = viewHeightPx
                 // 批注变化时重新渲染高亮；文档刚载入时也补一次
-                if (appliedHighlights[0] != annotationsJson) {
-                    appliedHighlights[0] = annotationsJson
-                    web.applyHighlights(annotationsJson)
+                val highlightsJson = annotationRanges.toHighlightJson()
+                if (appliedHighlights[0] != highlightsJson) {
+                    appliedHighlights[0] = highlightsJson
+                    web.annotationRanges = annotationRanges
                 }
+                deliverFind(web)
             },
         )
 
@@ -1887,8 +1896,23 @@ private class ReaderWebView(context: android.content.Context) : WebView(context)
     var onSelectionCleared: (() -> Unit)? = null
     var onHighlightTap: ((id: String) -> Unit)? = null
 
+    /** 点击区域：判定在 Kotlin 侧做（见 [ReaderTapZoneMath]），不再由脚本决定。 */
+    var tapZone: ReaderTapZone = ReaderTapZone.DEFAULT
+    var cssWidth: Int = 0
+    var cssHeight: Int = 0
+
+    var annotationRanges: List<AnnotationRange> = emptyList()
+        set(value) {
+            field = value
+            applyHighlights(value.toHighlightJson())
+        }
+
     private var jsActive = false
     private var restoreApplied = false
+
+    /** 最近一次要高亮的内容，脚本就绪后补推一次（否则先到的高亮会丢）。 */
+    private var highlightsJson: String = "[]"
+    private val pendingFind = PendingFindQueue()
 
     private var fallbackMaxScroll = 0
     private var fallbackMeasuring = false
@@ -1902,10 +1926,9 @@ private class ReaderWebView(context: android.content.Context) : WebView(context)
             post { onScriptState(page, pages, ratio, atEnd) }
         },
         onTap = { delta -> post { onTapZone?.invoke(delta) } },
-        onMenu = { post { onMenuTap?.invoke() } },
+        onPoint = { x, y, path, offset -> post { onPointerTap(x, y, path, offset) } },
         onSelection = { json -> post { onSelection?.invoke(json) } },
         onSelectionCleared = { post { onSelectionCleared?.invoke() } },
-        onHighlightTap = { id -> post { onHighlightTap?.invoke(id) } },
         onDebug = { message -> android.util.Log.d("TSUNDOKU_JS", message) },
     )
 
@@ -1913,11 +1936,54 @@ private class ReaderWebView(context: android.content.Context) : WebView(context)
         runCatching { addJavascriptInterface(bridge, BRIDGE_NAME) }
     }
 
+    /**
+     * 点击正文：先判高亮命中，再判点击区域。
+     *
+     * 高亮优先，是因为「点在高亮上」应该打开批注，而不是顺手翻页。
+     * 判定全部在 Kotlin 侧（[ReaderTapRouter]），可被单元测试覆盖。
+     */
+    private fun onPointerTap(x: Float, y: Float, path: String, offset: Int) {
+        val result = ReaderTapRouter.route(
+            ranges = annotationRanges,
+            path = path,
+            offset = offset,
+            zone = tapZone,
+            x = x,
+            y = y,
+            width = cssWidth.toFloat(),
+            height = cssHeight.toFloat(),
+        )
+        when (result) {
+            is TapResult.Highlight -> onHighlightTap?.invoke(result.id)
+            is TapResult.Action -> when (result.action) {
+                TapAction.NONE -> Unit
+                TapAction.MENU -> onMenuTap?.invoke()
+                TapAction.FORWARD -> if (pagedMode) onTapZone?.invoke(1)
+                TapAction.BACKWARD -> if (pagedMode) onTapZone?.invoke(-1)
+            }
+        }
+    }
+
+    /** 请求在正文里定位一段文字；WebView 未就绪时先排队（见 [PendingFindQueue]）。 */
+    fun requestFind(text: String) {
+        pendingFind.enqueue(text)
+        pushFind()
+    }
+
+    private fun pushFind() {
+        val text = pendingFind.take(jsActive) ?: return
+        restoreApplied = true
+        evaluateJavascript("window.__tsu&&window.__tsu.find(" + jsStringLiteral(text) + ")", null)
+    }
+
     // ---------- 脚本路径 ----------
 
     private fun onScriptReady() {
         jsActive = true
         applyRestore()
+        // 先还原位置、再定位搜索命中：后者会改动滚动位置，必须最后执行
+        pushHighlights()
+        pushFind()
     }
 
     private fun onScriptState(page: Int, pages: Int, ratio: Float, atEnd: Boolean) {
@@ -1934,6 +2000,7 @@ private class ReaderWebView(context: android.content.Context) : WebView(context)
 
     fun beginLoad() {
         restoreApplied = false
+        jsActive = false
         fallbackRestored = false
         fallbackMeasuring = false
         fallbackRestorePass = 0
@@ -1945,6 +2012,8 @@ private class ReaderWebView(context: android.content.Context) : WebView(context)
         postDelayed({
             if (jsActive) {
                 if (!restoreApplied) applyRestore()
+                // 兜底：万一 ready() 没有回调（脚本被拦截等），仍把排队的请求发出去
+                pushFind()
             } else {
                 prepareFallback()
             }
@@ -1981,14 +2050,18 @@ private class ReaderWebView(context: android.content.Context) : WebView(context)
         onResult(fallbackTurn(forward))
     }
 
-    /** 注入当前章节的批注并渲染高亮。 */
+    /** 注入当前章节的批注并渲染高亮；脚本未就绪时留到 `ready()` 再推。 */
     fun applyHighlights(json: String) {
-        evaluateJavascript("window.__tsu&&window.__tsu.highlights(" + jsStringLiteral(json) + ")", null)
+        highlightsJson = json
+        pushHighlights()
     }
 
-    /** 定位到某段文字（全书搜索跳转）。 */
-    fun findText(text: String) {
-        evaluateJavascript("window.__tsu&&window.__tsu.find(" + jsStringLiteral(text) + ")", null)
+    private fun pushHighlights() {
+        if (!jsActive) return
+        evaluateJavascript(
+            "window.__tsu&&window.__tsu.highlights(" + jsStringLiteral(highlightsJson) + ")",
+            null,
+        )
     }
 
     fun clearSelection() {
